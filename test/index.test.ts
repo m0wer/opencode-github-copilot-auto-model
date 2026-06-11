@@ -81,7 +81,7 @@ describe("opencode-github-copilot-auto-model", () => {
     expect(models.auto.id).toBe("auto")
     expect(models.auto.api.id).toBe("claude-sonnet-4-6-20250929")
     expect(models.auto.api.npm).toBe("@ai-sdk/anthropic")
-    expect(models.auto.name).toBe("Auto → Claude Sonnet 4.6")
+    expect(models.auto.name).toBe("Auto")
   })
 
   test("overrides request body model for auto in chat.params", async () => {
@@ -94,14 +94,14 @@ describe("opencode-github-copilot-auto-model", () => {
     expect(models.auto.id).toBe("auto")
     expect(models.auto.api.id).toBe("claude-sonnet-4-6-20250929")
     expect(models.auto.api.npm).toBe("@ai-sdk/anthropic")
-    expect(models.auto.name).toBe("Auto → Claude Sonnet 4.6")
+    expect(models.auto.name).toBe("Auto")
   })
 
   test("falls back to claude-haiku-4.5 as last resort", async () => {
     const models = await callHook({ "claude-haiku-4.5": haiku })
     expect(models.auto.id).toBe("auto")
     expect(models.auto.api.id).toBe("claude-haiku-4-5-20251001")
-    expect(models.auto.name).toBe("Auto → Claude Haiku 4.5")
+    expect(models.auto.name).toBe("Auto")
   })
 
   test("preserves /v1 in url for Claude models (Anthropic SDK appends /messages, not /v1/messages)", async () => {
