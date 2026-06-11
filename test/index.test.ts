@@ -1,0 +1,94 @@
+import { describe, expect, test } from "bun:test"
+import plugin from "../src/index"
+
+const makeModel = (id: string, apiId: string, npm: string, url: string, name: string) => ({
+  id,
+  providerID: "github-copilot",
+  api: { id: apiId, url, npm },
+  name,
+  family: "gpt",
+  status: "active",
+  headers: {},
+  options: {},
+  cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+  limit: { context: 200000, output: 8192 },
+  capabilities: {
+    temperature: true,
+    reasoning: false,
+    attachment: true,
+    toolcall: true,
+    input: { text: true, audio: false, image: false, video: false, pdf: false },
+    output: { text: true, audio: false, image: false, video: false, pdf: false },
+    interleaved: false,
+  },
+  release_date: "2026-01-01",
+})
+
+const sonnet = makeModel(
+  "claude-sonnet-4.6",
+  "claude-sonnet-4-6-20250929",
+  "@ai-sdk/anthropic",
+  "https://api.githubcopilot.com/v1",
+  "Claude Sonnet 4.6",
+)
+const codex = makeModel(
+  "gpt-5.3-codex",
+  "gpt-5.3-codex",
+  "@ai-sdk/github-copilot",
+  "https://api.githubcopilot.com",
+  "GPT-5.3 Codex",
+)
+const haiku = makeModel(
+  "claude-haiku-4.5",
+  "claude-haiku-4-5-20251001",
+  "@ai-sdk/anthropic",
+  "https://api.githubcopilot.com/v1",
+  "Claude Haiku 4.5",
+)
+
+async function callHook(models: Record<string, unknown>) {
+  const hooks = await plugin.server({} as never, {})
+  return hooks.provider!.models!({ id: "github-copilot", models } as never, {})
+}
+
+describe("opencode-github-copilot-auto-model", () => {
+  test("prefers claude-sonnet-4.6 first", async () => {
+    const models = await callHook({ "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex })
+    expect(models.auto).toBeDefined()
+    expect(models.auto.api.id).toBe("claude-sonnet-4-6-20250929")
+    expect(models.auto.api.npm).toBe("@ai-sdk/anthropic")
+    expect(models.auto.name).toBe("Auto → Claude Sonnet 4.6")
+  })
+
+  test("falls back to gpt-5.3-codex when sonnet absent", async () => {
+    const models = await callHook({ "gpt-5.3-codex": codex, "claude-haiku-4.5": haiku })
+    expect(models.auto.api.id).toBe("gpt-5.3-codex")
+    expect(models.auto.api.npm).toBe("@ai-sdk/github-copilot")
+    expect(models.auto.name).toBe("Auto → GPT-5.3 Codex")
+  })
+
+  test("falls back to claude-haiku-4.5 as last resort", async () => {
+    const models = await callHook({ "claude-haiku-4.5": haiku })
+    expect(models.auto.api.id).toBe("claude-haiku-4-5-20251001")
+    expect(models.auto.name).toBe("Auto → Claude Haiku 4.5")
+  })
+
+  test("preserves /v1 in url for Claude models (Anthropic SDK appends /messages, not /v1/messages)", async () => {
+    const models = await callHook({ "claude-sonnet-4.6": sonnet })
+    expect(models.auto.api.url).toBe("https://api.githubcopilot.com/v1")
+  })
+
+  test("no-ops when auto already present", async () => {
+    const existing = makeModel("auto", "auto", "@ai-sdk/github-copilot", "https://api.githubcopilot.com", "Auto")
+    const models = await callHook({ auto: existing, "gpt-5.3-codex": codex })
+    expect(models.auto.api.id).toBe("auto")
+  })
+
+  test("returns unchanged models when no auto-eligible models found", async () => {
+    const other = makeModel("gpt-5.5", "gpt-5.5", "@ai-sdk/github-copilot", "https://api.githubcopilot.com", "GPT-5.5")
+    const models = await callHook({ "gpt-5.5": other })
+    // Falls back to "any Copilot model" — auto gets injected with gpt-5.5
+    expect(models.auto).toBeDefined()
+    expect(models.auto.api.id).toBe("gpt-5.5")
+  })
+})

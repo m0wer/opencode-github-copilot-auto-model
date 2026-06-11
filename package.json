@@ -1,0 +1,57 @@
+{
+  "name": "opencode-github-copilot-auto-model",
+  "version": "0.1.0",
+  "description": "Expose GitHub Copilot's Auto model in opencode's model picker",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "bun build ./src/index.ts --outfile ./dist/index.js --target node --format esm --external @opencode-ai/plugin --external @opencode-ai/sdk",
+    "dev": "bun build ./src/index.ts --outfile ./dist/index.js --target node --format esm --external @opencode-ai/plugin --external @opencode-ai/sdk --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "prepublishOnly": "bun run build"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*",
+    "@opencode-ai/sdk": "*"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "*",
+    "@opencode-ai/sdk": "*",
+    "@types/bun": "latest",
+    "typescript": "^5.5.0"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "github-copilot",
+    "auto-model"
+  ],
+  "license": "MIT",
+  "author": "m0wer",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/m0wer/opencode-github-copilot-auto-model.git"
+  },
+  "bugs": {
+    "url": "https://github.com/m0wer/opencode-github-copilot-auto-model/issues"
+  },
+  "homepage": "https://github.com/m0wer/opencode-github-copilot-auto-model#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  }
+}
