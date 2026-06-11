@@ -1,6 +1,6 @@
 # opencode-github-copilot-auto-model
 
-Adds a `github-copilot/auto` model to opencode that routes through Claude Sonnet 4.6 (or whichever auto-eligible Copilot model you have available).
+Adds a `github-copilot/auto` model to opencode that routes through Claude Sonnet 4.6 by default (falling back to GPT-5.3 Codex and Claude Haiku 4.5).
 
 GitHub Copilot's `auto` model ID is not accepted by the API directly — it only works as a client-side selection concept. This plugin picks the best available model from Copilot's actual "auto" pool and exposes it as `github-copilot/auto` in the model picker.
 
@@ -44,7 +44,7 @@ To pin a specific model as the first choice:
 
 ## How it works
 
-The plugin hooks into opencode's provider model discovery for `github-copilot`. It copies the chosen template model's full API config (`npm`, `url`, `api.id`) so routing is identical to using that model directly:
+The plugin hooks into opencode's provider model discovery for `github-copilot`. It first calls Copilot's `/models/session` endpoint to get the current auto session token and selected model, then aliases `github-copilot/auto` to that backing model while keeping the `Auto → ...` display label. For runtime requests it forwards `Copilot-Session-Token` and overrides the outgoing chat body model so routing follows Copilot's auto session decisions.
 
 - Claude models → `@ai-sdk/anthropic` + `https://api.githubcopilot.com/v1/messages`
 - GPT models → `@ai-sdk/github-copilot` + `https://api.githubcopilot.com/chat/completions`

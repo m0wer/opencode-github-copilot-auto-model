@@ -51,24 +51,55 @@ async function callHook(models: Record<string, unknown>) {
   return hooks.provider!.models!({ id: "github-copilot", models } as never, {})
 }
 
+async function callChatParams(models: Record<string, unknown>) {
+  const hooks = await plugin.server({} as never, {})
+  const resolved = await hooks.provider!.models!({ id: "github-copilot", models } as never, {})
+  const output = {
+    temperature: 0,
+    topP: 0,
+    topK: 0,
+    maxOutputTokens: undefined as number | undefined,
+    options: {} as Record<string, unknown>,
+  }
+  await hooks["chat.params"]!(
+    {
+      sessionID: "ses_test",
+      agent: "build",
+      model: { ...resolved.auto, id: "auto" },
+      provider: { source: "config", info: {} as never, options: {} },
+      message: {} as never,
+    },
+    output,
+  )
+  return output
+}
+
 describe("opencode-github-copilot-auto-model", () => {
   test("prefers claude-sonnet-4.6 first", async () => {
     const models = await callHook({ "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex })
     expect(models.auto).toBeDefined()
+    expect(models.auto.id).toBe("claude-sonnet-4.6")
     expect(models.auto.api.id).toBe("claude-sonnet-4-6-20250929")
     expect(models.auto.api.npm).toBe("@ai-sdk/anthropic")
     expect(models.auto.name).toBe("Auto → Claude Sonnet 4.6")
   })
 
-  test("falls back to gpt-5.3-codex when sonnet absent", async () => {
-    const models = await callHook({ "gpt-5.3-codex": codex, "claude-haiku-4.5": haiku })
-    expect(models.auto.api.id).toBe("gpt-5.3-codex")
-    expect(models.auto.api.npm).toBe("@ai-sdk/github-copilot")
-    expect(models.auto.name).toBe("Auto → GPT-5.3 Codex")
+  test("overrides request body model for auto in chat.params", async () => {
+    const output = await callChatParams({ "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex })
+    expect(output.options.model).toBe("claude-sonnet-4-6-20250929")
+  })
+
+  test("falls back to claude-sonnet-4.6 when codex absent", async () => {
+    const models = await callHook({ "claude-sonnet-4.6": sonnet, "claude-haiku-4.5": haiku })
+    expect(models.auto.id).toBe("claude-sonnet-4.6")
+    expect(models.auto.api.id).toBe("claude-sonnet-4-6-20250929")
+    expect(models.auto.api.npm).toBe("@ai-sdk/anthropic")
+    expect(models.auto.name).toBe("Auto → Claude Sonnet 4.6")
   })
 
   test("falls back to claude-haiku-4.5 as last resort", async () => {
     const models = await callHook({ "claude-haiku-4.5": haiku })
+    expect(models.auto.id).toBe("claude-haiku-4.5")
     expect(models.auto.api.id).toBe("claude-haiku-4-5-20251001")
     expect(models.auto.name).toBe("Auto → Claude Haiku 4.5")
   })
