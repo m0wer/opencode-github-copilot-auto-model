@@ -1,6 +1,6 @@
 # opencode-github-copilot-auto-model
 
-Adds a `github-copilot/auto` model to opencode that routes through Claude Sonnet 4.6 by default (falling back to GPT-5.3 Codex and Claude Haiku 4.5).
+Adds a `github-copilot/auto` model to opencode using GitHub Copilot's own auto-session routing.
 
 GitHub Copilot's `auto` model ID is not accepted by the API directly — it only works as a client-side selection concept. This plugin picks the best available model from Copilot's actual "auto" pool and exposes it as `github-copilot/auto` in the model picker.
 
@@ -16,31 +16,7 @@ Add to `~/.config/opencode/opencode.json`:
 }
 ```
 
-The model will then appear as **`Auto → Claude Sonnet 4.6`** (or whichever was picked) in the prompt bar.
-
-## Preference order
-
-The plugin selects the first available model from this list:
-
-1. `claude-sonnet-4.6`
-2. `gpt-5.3-codex`
-3. `claude-haiku-4.5`
-4. Any other Copilot model (fallback)
-
-To pin a specific model as the first choice:
-
-```jsonc
-{
-  "plugin": [
-    [
-      "github:m0wer/opencode-github-copilot-auto-model",
-      { "preferredModel": "gpt-5.3-codex" }
-    ]
-  ]
-}
-```
-
-`preferredModel` must match a key from `opencode models` for the `github-copilot` provider (e.g. `gpt-5.3-codex`, `claude-sonnet-4.6`, `claude-haiku-4.5`).
+The model will then appear as **`Auto → <selected model>`** in the prompt bar.
 
 ## How it works
 

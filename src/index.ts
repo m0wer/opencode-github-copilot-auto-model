@@ -8,28 +8,13 @@ const MODEL_ID = "auto"
 const PROVIDER_ID = "github-copilot"
 const COPILOT_API_VERSION = "2026-01-09"
 
-// Preference order matches the models GitHub Copilot's own "auto" feature picks from.
-// Model keys as they appear in opencode's model picker (github-copilot/<key>).
-const AUTO_ELIGIBLE = ["claude-sonnet-4.6", "gpt-5.3-codex", "claude-haiku-4.5"]
-
-type Options = {
-  // Override the first-choice model key (e.g. "gpt-5.3-codex").
-  // Must be a model key from `opencode models` for github-copilot.
-  preferredModel?: string
-}
-
 type AutoSessionState = {
   selectedModelID: string
   sessionToken: string
   expiresAtMs: number
 }
 
-function pickTemplate(models: Record<string, Model>, preferred?: string) {
-  if (preferred && models[preferred]) return models[preferred]
-  for (const id of AUTO_ELIGIBLE) {
-    if (models[id]) return models[id]
-  }
-  // Broader fallback: any Copilot model
+function pickTemplate(models: Record<string, Model>) {
   return Object.values(models).find((m) => m.providerID === PROVIDER_ID)
 }
 
@@ -108,9 +93,9 @@ async function getAutoSession(baseURL: string, bearer: string) {
   return autoSession
 }
 
-function withAutoModel(models: Record<string, Model>, preferred?: string, selected?: Model) {
+function withAutoModel(models: Record<string, Model>, selected?: Model) {
   if (models[MODEL_ID]) return models
-  const template = selected ?? pickTemplate(models, preferred)
+  const template = selected ?? pickTemplate(models)
   if (!template) return models
 
   // Copy the template's api (id, npm, url) exactly — they already point to the right endpoint.
@@ -130,9 +115,7 @@ function withAutoModel(models: Record<string, Model>, preferred?: string, select
   }
 }
 
-const CopilotAutoModelPlugin: Plugin = async (_input, options) => {
-  const preferred = ((options ?? {}) as Options).preferredModel
-
+const CopilotAutoModelPlugin: Plugin = async (_input) => {
   return {
     "chat.params": async (incoming, output) => {
       if (incoming.model.providerID !== PROVIDER_ID) return
@@ -151,7 +134,7 @@ const CopilotAutoModelPlugin: Plugin = async (_input, options) => {
     provider: {
       id: PROVIDER_ID,
       async models(provider, ctx) {
-        let template = pickTemplate(provider.models, preferred)
+        let template = pickTemplate(provider.models)
         selectedAutoSessionToken = undefined
 
         if (template && ctx.auth?.type === "oauth") {
@@ -167,7 +150,7 @@ const CopilotAutoModelPlugin: Plugin = async (_input, options) => {
         }
 
         if (template) selectedAutoApiModelID = template.api.id
-        return withAutoModel(provider.models, preferred, template)
+        return withAutoModel(provider.models, template)
       },
     },
   }

@@ -75,7 +75,7 @@ async function callChatParams(models: Record<string, unknown>) {
 }
 
 describe("opencode-github-copilot-auto-model", () => {
-  test("prefers claude-sonnet-4.6 first", async () => {
+  test("uses first available copilot model when no auto session is available", async () => {
     const models = await callHook({ "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex })
     expect(models.auto).toBeDefined()
     expect(models.auto.id).toBe("claude-sonnet-4.6")
@@ -89,7 +89,7 @@ describe("opencode-github-copilot-auto-model", () => {
     expect(output.options.model).toBe("claude-sonnet-4-6-20250929")
   })
 
-  test("falls back to claude-sonnet-4.6 when codex absent", async () => {
+  test("falls back to another available copilot model", async () => {
     const models = await callHook({ "claude-sonnet-4.6": sonnet, "claude-haiku-4.5": haiku })
     expect(models.auto.id).toBe("claude-sonnet-4.6")
     expect(models.auto.api.id).toBe("claude-sonnet-4-6-20250929")
@@ -115,10 +115,9 @@ describe("opencode-github-copilot-auto-model", () => {
     expect(models.auto.api.id).toBe("auto")
   })
 
-  test("returns unchanged models when no auto-eligible models found", async () => {
+  test("injects auto from any available copilot model", async () => {
     const other = makeModel("gpt-5.5", "gpt-5.5", "@ai-sdk/github-copilot", "https://api.githubcopilot.com", "GPT-5.5")
     const models = await callHook({ "gpt-5.5": other })
-    // Falls back to "any Copilot model" — auto gets injected with gpt-5.5
     expect(models.auto).toBeDefined()
     expect(models.auto.api.id).toBe("gpt-5.5")
   })
