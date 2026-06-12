@@ -63,8 +63,42 @@ type RouterDecision = {
   sticky_override?: boolean
 }
 
+type Options = {
+  // General preference: nudge which model is used regardless of reasoning label.
+  // Accepts a model key (e.g. "claude-sonnet-4.6") or API id.
+  preferredModel?: string
+  preferredModels?: string[]
+}
+
 function pickTemplate(models: Record<string, Model>) {
   return Object.values(models).find((m) => m.providerID === PROVIDER_ID)
+}
+
+function normalizePreferred(options?: Options): string[] {
+  const ordered = [options?.preferredModel, ...(options?.preferredModels ?? [])]
+  const deduped: string[] = []
+  for (const raw of ordered) {
+    if (typeof raw !== "string") continue
+    const value = raw.trim()
+    if (!value || deduped.includes(value)) continue
+    deduped.push(value)
+  }
+  return deduped
+}
+
+function resolvePreferredApiIDs(models: Record<string, Model>, preferred: string[]): string[] {
+  const resolved: string[] = []
+  const entries = Object.values(models).filter((model) => model.providerID === PROVIDER_ID)
+  for (const token of preferred) {
+    const byKey = models[token]
+    if (byKey?.providerID === PROVIDER_ID) {
+      if (!resolved.includes(byKey.api.id)) resolved.push(byKey.api.id)
+      continue
+    }
+    const byApiId = entries.find((model) => model.api.id === token)
+    if (byApiId && !resolved.includes(byApiId.api.id)) resolved.push(byApiId.api.id)
+  }
+  return resolved
 }
 
 // File logger — avoids polluting the TUI.
@@ -280,8 +314,13 @@ function poolFamilyCount(npm: string, url: string, pool: string[]): number {
 }
 
 // Mirror VS Code's provider-stickiness: take the first candidate in our endpoint family.
-function pickSameFamilyCandidate(candidates: string[]): string | undefined {
-  return candidates.find((candidate) => isSameFamily(candidate))
+function pickSameFamilyCandidate(candidates: string[], preferredApiIDs: string[]): string | undefined {
+  const sameFamily = candidates.filter((candidate) => isSameFamily(candidate))
+  if (!sameFamily.length) return undefined
+  for (const preferred of preferredApiIDs) {
+    if (sameFamily.includes(preferred)) return preferred
+  }
+  return sameFamily[0]
 }
 
 // Mirror VS Code's _selectDefaultModel: when the router is skipped/fails, the default
@@ -290,6 +329,13 @@ function pickSameFamilyCandidate(candidates: string[]): string | undefined {
 // default purely from available_models and never reads the undocumented selected_model.
 function defaultPoolModel(pool: string[]): string | undefined {
   return pool.find((id) => isSameFamily(id))
+}
+
+function preferredPoolModel(pool: string[], preferredApiIDs: string[]): string | undefined {
+  for (const preferred of preferredApiIDs) {
+    if (pool.includes(preferred) && isSameFamily(preferred)) return preferred
+  }
+  return undefined
 }
 
 // Map the router's reasoning verdict to a provider-native effort knob for the routed
@@ -327,8 +373,7 @@ function withAutoModel(models: Record<string, Model>, selected?: Model) {
       ...template,
       // Stable picker id (upstream): the override fires off `incoming.model.id === "auto"`.
       id: MODEL_ID,
-      // Static label: the real model is chosen per turn (see the plugin log), so don't
-      // promise a specific backing model in the picker / status bar.
+      // Static label — the per-turn routing decision is surfaced as a transient toast.
       name: "Auto",
       family: "github-copilot-auto",
       variants: undefined,
@@ -336,7 +381,10 @@ function withAutoModel(models: Record<string, Model>, selected?: Model) {
   }
 }
 
-const CopilotAutoModelPlugin: Plugin = async ({ client }) => {
+const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
+  const opts = (options ?? {}) as Options
+  const preferred = normalizePreferred(opts)
+  let preferredApiIDs: string[] = []
   // The status bar can't show the per-turn route, so surface it as a transient toast
   // whenever the model is (re)picked. Fire-and-forget; never let it break a turn.
   const toast = (message: string, variant: "info" | "success" | "warning" | "error") => {
@@ -380,6 +428,7 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }) => {
       // is clamped to the cloned endpoint's family (catalogDefaultModelID / autoTemplateApi.id
       // always are; the session's selected pick may drift to another family).
       let decided =
+        preferredPoolModel(session?.availableModels ?? [], preferredApiIDs) ??
         defaultPoolModel(session?.availableModels ?? []) ??
         (isSameFamily(session?.selectedModelID) ? session?.selectedModelID : undefined) ??
         catalogDefaultModelID ??
@@ -412,7 +461,7 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }) => {
           )
           const candidates = decision?.candidate_models ?? []
           if (candidates.length) {
-            const sameFamily = pickSameFamilyCandidate(candidates)
+            const sameFamily = pickSameFamilyCandidate(candidates, preferredApiIDs)
             if (sameFamily) {
               decided = sameFamily
               log(
@@ -432,9 +481,10 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }) => {
           conv.routedModelID = decided
           conv.routedLabel = decision?.predicted_label
           conv.needsReEval = false
-          conv.turn = conv.turn + 1
         }
       }
+
+      conv.turn = conv.turn + 1
 
       if (decided && decided !== MODEL_ID) {
         output.options.model = decided
@@ -461,7 +511,13 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }) => {
       id: PROVIDER_ID,
       async models(provider, ctx) {
         autoKnownModels = Object.values(provider.models)
+        preferredApiIDs = resolvePreferredApiIDs(provider.models, preferred)
         let template = pickTemplate(provider.models)
+        const preferredTemplate = preferredApiIDs.map(modelByApiId).find((model): model is Model => !!model)
+        if (preferredTemplate) {
+          template = preferredTemplate
+          log(`preference anchor -> ${preferredTemplate.api.id}`)
+        }
 
         if (template && ctx.auth?.type === "oauth") {
           autoBaseURL = capiBase(template.api.url)
@@ -471,10 +527,18 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }) => {
           const session = await fetchAutoSession(autoBaseURL, ctx.auth.refresh)
           if (session) {
             template = modelByApiId(session.selectedModelID) ?? template
+            const preferredInPool = preferredApiIDs.find((id) => session.availableModels.includes(id))
+            if (preferredInPool) {
+              const preferredModel = modelByApiId(preferredInPool)
+              if (preferredModel) {
+                template = preferredModel
+                log(`preference session pick -> ${preferredModel.api.id}`)
+              }
+            }
             // Guard: if the selected model's family has no fast/strong pair in the pool,
             // the within-family router can't do anything — anchor on a family that does
             // (still a genuine Copilot auto model from the pool).
-            if (poolFamilyCount(template.api.npm, template.api.url, session.availableModels) < 2) {
+            if (!preferredInPool && poolFamilyCount(template.api.npm, template.api.url, session.availableModels) < 2) {
               const richer = session.availableModels
                 .map(modelByApiId)
                 .find((model) => model && poolFamilyCount(model.api.npm, model.api.url, session.availableModels) >= 2)

@@ -46,13 +46,13 @@ const haiku = makeModel(
   "Claude Haiku 4.5",
 )
 
-async function callHook(models: Record<string, unknown>) {
-  const hooks = await plugin.server({} as never, {})
+async function callHook(models: Record<string, unknown>, options?: Record<string, unknown>) {
+  const hooks = await plugin.server({} as never, options ?? {})
   return hooks.provider!.models!({ id: "github-copilot", models } as never, {})
 }
 
-async function callChatParams(models: Record<string, unknown>) {
-  const hooks = await plugin.server({} as never, {})
+async function callChatParams(models: Record<string, unknown>, options?: Record<string, unknown>) {
+  const hooks = await plugin.server({} as never, options ?? {})
   const resolved = await hooks.provider!.models!({ id: "github-copilot", models } as never, {})
   const output = {
     temperature: 0,
@@ -120,5 +120,29 @@ describe("opencode-github-copilot-auto-model", () => {
     const models = await callHook({ "gpt-5.5": other })
     expect(models.auto).toBeDefined()
     expect(models.auto.api.id).toBe("gpt-5.5")
+  })
+
+  test("supports preferredModel by model key", async () => {
+    const models = await callHook(
+      { "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex },
+      { preferredModel: "gpt-5.3-codex" },
+    )
+    expect(models.auto.api.id).toBe("gpt-5.3-codex")
+  })
+
+  test("supports preferredModels ordered list", async () => {
+    const models = await callHook(
+      { "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex },
+      { preferredModels: ["missing", "gpt-5.3-codex", "claude-sonnet-4.6"] },
+    )
+    expect(models.auto.api.id).toBe("gpt-5.3-codex")
+  })
+
+  test("chat.params uses preferred fallback model when sessions are unavailable", async () => {
+    const output = await callChatParams(
+      { "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex },
+      { preferredModel: "gpt-5.3-codex" },
+    )
+    expect(output.options.model).toBe("gpt-5.3-codex")
   })
 })
