@@ -68,10 +68,26 @@ type Options = {
   // Accepts a model key (e.g. "claude-sonnet-4.6") or API id.
   preferredModel?: string
   preferredModels?: string[]
+  // Per-label preferences: override candidate selection for a specific routing verdict.
+  // Accepts a model key / API id, or an ordered list of them.
+  // Note: only within-family candidates are valid (the auto model has a single endpoint).
+  // Cross-family entries are logged and skipped.
+  reasoning?: string | string[]
+  noReasoning?: string | string[]
 }
 
 function pickTemplate(models: Record<string, Model>) {
   return Object.values(models).find((m) => m.providerID === PROVIDER_ID)
+}
+
+function normalizeTokenList(value: string | string[] | undefined): string[] {
+  const raw = Array.isArray(value) ? value : value !== undefined ? [value] : []
+  const deduped: string[] = []
+  for (const token of raw) {
+    const v = token.trim()
+    if (v && !deduped.includes(v)) deduped.push(v)
+  }
+  return deduped
 }
 
 function normalizePreferred(options?: Options): string[] {
@@ -384,7 +400,11 @@ function withAutoModel(models: Record<string, Model>, selected?: Model) {
 const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
   const opts = (options ?? {}) as Options
   const preferred = normalizePreferred(opts)
+  const reasoningTokens = normalizeTokenList(opts.reasoning)
+  const noReasoningTokens = normalizeTokenList(opts.noReasoning)
   let preferredApiIDs: string[] = []
+  let reasoningApiIDs: string[] = []
+  let noReasoningApiIDs: string[] = []
   // The status bar can't show the per-turn route, so surface it as a transient toast
   // whenever the model is (re)picked. Fire-and-forget; never let it break a turn.
   const toast = (message: string, variant: "info" | "success" | "warning" | "error") => {
@@ -461,11 +481,18 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
           )
           const candidates = decision?.candidate_models ?? []
           if (candidates.length) {
-            const sameFamily = pickSameFamilyCandidate(candidates, preferredApiIDs)
+            // Use label-specific preferences when available; fall back to general list.
+            const label = decision?.predicted_label
+            const labelPrefs =
+              label === "needs_reasoning" ? reasoningApiIDs
+              : label === "no_reasoning" ? noReasoningApiIDs
+              : preferredApiIDs
+            const effectivePrefs = labelPrefs.length ? labelPrefs : preferredApiIDs
+            const sameFamily = pickSameFamilyCandidate(candidates, effectivePrefs)
             if (sameFamily) {
               decided = sameFamily
               log(
-                `intent routed -> ${decided} (top=${candidates[0]}, label=${decision?.predicted_label}, confidence=${decision?.confidence})`,
+                `intent routed -> ${decided} (top=${candidates[0]}, label=${label}, confidence=${decision?.confidence})`,
               )
             } else {
               log(`intent top=${candidates[0]} not same-family as ${autoTemplateApi?.id}; keeping ${decided}`)
@@ -512,6 +539,8 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
       async models(provider, ctx) {
         autoKnownModels = Object.values(provider.models)
         preferredApiIDs = resolvePreferredApiIDs(provider.models, preferred)
+        reasoningApiIDs = resolvePreferredApiIDs(provider.models, reasoningTokens)
+        noReasoningApiIDs = resolvePreferredApiIDs(provider.models, noReasoningTokens)
         let template = pickTemplate(provider.models)
         const preferredTemplate = preferredApiIDs.map(modelByApiId).find((model): model is Model => !!model)
         if (preferredTemplate) {

@@ -74,6 +74,76 @@ async function callChatParams(models: Record<string, unknown>, options?: Record<
   return output
 }
 
+// Simulates a full session+intent routing cycle with mocked fetch, used to test
+// per-label preference and label-suffix behavior.
+async function callChatParamsWithRouting(
+  models: Record<string, unknown>,
+  options: Record<string, unknown>,
+  sessionID: string,
+  intentResponse: {
+    predicted_label: "needs_reasoning" | "no_reasoning"
+    candidate_models: string[]
+    confidence: number
+  },
+) {
+  const origFetch = globalThis.fetch
+  const availableModels = Object.values(models)
+    .filter((m) => (m as { providerID: string }).providerID === "github-copilot")
+    .map((m) => (m as { api: { id: string } }).api.id)
+  const mockSession = {
+    session_token: "test-session-token",
+    selected_model: availableModels[0],
+    available_models: availableModels,
+    expires_at: Math.floor(Date.now() / 1000) + 3600,
+  }
+  const mockFetch = async (url: string | URL | Request, _init?: RequestInit): Promise<Response> => {
+    const u = url.toString()
+    if (u.includes("/models/session/intent"))
+      return new Response(JSON.stringify(intentResponse), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    if (u.includes("/models/session"))
+      return new Response(JSON.stringify(mockSession), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    return origFetch(url, _init)
+  }
+  globalThis.fetch = mockFetch as unknown as typeof fetch
+  try {
+    const hooks = await plugin.server({} as never, options)
+    const resolved =     await hooks.provider!.models!({ id: "github-copilot", models } as never, {
+      auth: { type: "oauth", refresh: "test-bearer", access: "test-access", expires: Date.now() + 3600_000 } as never,
+    })
+    await hooks["chat.message"]!(
+      { sessionID } as never,
+      { parts: [{ type: "text", text: "test prompt" }] } as never,
+    )
+    const output = {
+      temperature: 0,
+      topP: 0,
+      topK: 0,
+      maxOutputTokens: undefined as number | undefined,
+      options: {} as Record<string, unknown>,
+      headers: {} as Record<string, string>,
+    }
+    await hooks["chat.params"]!(
+      {
+        sessionID,
+        agent: "build",
+        model: resolved.auto,
+        provider: { source: "config", info: {} as never, options: {} },
+        message: {} as never,
+      },
+      output,
+    )
+    return { output, resolved }
+  } finally {
+    globalThis.fetch = origFetch
+  }
+}
+
 describe("opencode-github-copilot-auto-model", () => {
   test("uses first available copilot model when no auto session is available", async () => {
     const models = await callHook({ "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex })
@@ -144,5 +214,33 @@ describe("opencode-github-copilot-auto-model", () => {
       { preferredModel: "gpt-5.3-codex" },
     )
     expect(output.options.model).toBe("gpt-5.3-codex")
+  })
+
+  test("noReasoning option picks preferred fast model when intent says no_reasoning", async () => {
+    const { output } = await callChatParamsWithRouting(
+      { "claude-sonnet-4.6": sonnet, "claude-haiku-4.5": haiku },
+      { noReasoning: "claude-haiku-4.5" },
+      "ses_no_reasoning_1",
+      {
+        predicted_label: "no_reasoning",
+        candidate_models: ["claude-sonnet-4-6-20250929", "claude-haiku-4-5-20251001"],
+        confidence: 0.95,
+      },
+    )
+    expect(output.options.model).toBe("claude-haiku-4-5-20251001")
+  })
+
+  test("reasoning option picks preferred strong model when intent says needs_reasoning", async () => {
+    const { output } = await callChatParamsWithRouting(
+      { "claude-sonnet-4.6": sonnet, "claude-haiku-4.5": haiku },
+      { reasoning: "claude-sonnet-4.6", noReasoning: "claude-haiku-4.5" },
+      "ses_reasoning_1",
+      {
+        predicted_label: "needs_reasoning",
+        candidate_models: ["claude-haiku-4-5-20251001", "claude-sonnet-4-6-20250929"],
+        confidence: 0.91,
+      },
+    )
+    expect(output.options.model).toBe("claude-sonnet-4-6-20250929")
   })
 })
