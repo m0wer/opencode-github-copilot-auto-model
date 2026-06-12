@@ -192,10 +192,10 @@ describe("opencode-github-copilot-auto-model", () => {
     expect(models.auto.api.id).toBe("gpt-5.5")
   })
 
-  test("supports preferredModel by model key", async () => {
+  test("supports preferredModels by model key", async () => {
     const models = await callHook(
       { "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex },
-      { preferredModel: "gpt-5.3-codex" },
+      { preferredModels: ["gpt-5.3-codex"] },
     )
     expect(models.auto.api.id).toBe("gpt-5.3-codex")
   })
@@ -211,7 +211,7 @@ describe("opencode-github-copilot-auto-model", () => {
   test("chat.params uses preferred fallback model when sessions are unavailable", async () => {
     const output = await callChatParams(
       { "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex },
-      { preferredModel: "gpt-5.3-codex" },
+      { preferredModels: ["gpt-5.3-codex"] },
     )
     expect(output.options.model).toBe("gpt-5.3-codex")
   })
@@ -219,7 +219,7 @@ describe("opencode-github-copilot-auto-model", () => {
   test("noReasoning option picks preferred fast model when intent says no_reasoning", async () => {
     const { output } = await callChatParamsWithRouting(
       { "claude-sonnet-4.6": sonnet, "claude-haiku-4.5": haiku },
-      { noReasoning: "claude-haiku-4.5" },
+      { noReasoning: ["claude-haiku-4.5"] },
       "ses_no_reasoning_1",
       {
         predicted_label: "no_reasoning",
@@ -233,7 +233,7 @@ describe("opencode-github-copilot-auto-model", () => {
   test("reasoning option picks preferred strong model when intent says needs_reasoning", async () => {
     const { output } = await callChatParamsWithRouting(
       { "claude-sonnet-4.6": sonnet, "claude-haiku-4.5": haiku },
-      { reasoning: "claude-sonnet-4.6", noReasoning: "claude-haiku-4.5" },
+      { reasoning: ["claude-sonnet-4.6"], noReasoning: ["claude-haiku-4.5"] },
       "ses_reasoning_1",
       {
         predicted_label: "needs_reasoning",

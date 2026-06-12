@@ -33,16 +33,16 @@ always runs regardless):
     [
       "github:m0wer/opencode-github-copilot-auto-model",
       {
-        // General preference: which model to prefer when present in the session pool.
-        // Accepts a model key (e.g. "claude-sonnet-4.6") or API id; ordered fallback list.
-        "preferredModel": "claude-sonnet-4.6",
-        "preferredModels": ["claude-sonnet-4.6", "claude-haiku-4.5"],
+        // Ordered list of preferred models; first match in the session pool wins.
+        // Accepts model keys (e.g. "claude-sonnet-4.6") or API ids.
+        // Sets the endpoint anchor and routing fallback.
+        "preferredModels": ["claude-sonnet-4.6", "gpt-5.3-codex"],
 
         // Per-label preferences: steer candidate selection per routing verdict.
-        // Only models in the same endpoint family as the anchor are considered
-        // (see "Within-family constraint" below).
-        "reasoning": "claude-sonnet-4.6",
-        "noReasoning": ["claude-haiku-4.5", "claude-sonnet-4.6"]
+        // Only models in the same endpoint family as the anchor are usable
+        // (see "Within-family constraint"). Cross-family entries are skipped.
+        "reasoning": ["claude-sonnet-4.6", "gpt-5.3-codex"],
+        "noReasoning": ["gpt-5.3-codex", "claude-sonnet-4.6"]
       }
     ]
   ]
@@ -53,10 +53,17 @@ Options summary:
 
 | Option | Type | Description |
 |--------|------|-------------|
-| `preferredModel` | string | Model key or API id to prefer in the session pool. |
-| `preferredModels` | string[] | Ordered fallback list; first pool match wins. |
-| `reasoning` | string \| string[] | Preferred model(s) when the intent router returns `needs_reasoning`. |
-| `noReasoning` | string \| string[] | Preferred model(s) when the intent router returns `no_reasoning`. |
+| `preferredModels` | string[] | Ordered fallback list; first pool match sets the anchor and default model. |
+| `reasoning` | string[] | Preferred model(s) when the intent router returns `needs_reasoning`. |
+| `noReasoning` | string[] | Preferred model(s) when the intent router returns `no_reasoning`. |
+
+> **On cross-family preferences (e.g. claude-sonnet-4.6 for reasoning, gpt-5.3-codex
+> for noReasoning):** the routing label is independent of model family — the intent
+> router ranks both Claude and GPT models in a single list. However, the plugin has
+> one fixed endpoint per session (the anchor family), so a cross-family preference
+> entry is silently skipped and the best same-family candidate is used instead.
+> A cross-family split (Claude for reasoning, GPT for fast) would require either
+> two separate auto models in the picker or a request proxy.
 
 ## How it works
 
@@ -126,15 +133,15 @@ sent to that endpoint, not the endpoint itself. This means:
 
 ### Model preference options: when are they useful?
 
-`preferredModel` / `preferredModels`: nudge which model from the pool is used as the
-anchor and fallback default. Useful if you always want a specific model family or tier
-(e.g. always prefer Sonnet over Codex as the anchor).
+`preferredModels`: nudge which model from the pool is used as the anchor and fallback
+default. Useful if you always want a specific model family or tier (e.g. always anchor
+on Claude Sonnet rather than whatever Copilot's session picks as default).
 
 `reasoning` / `noReasoning`: override candidate selection within the anchor family
 after the routing label is known. Useful for within-family tier control — for example,
-if your anchor is Claude, `{ reasoning: "claude-sonnet-4.6", noReasoning: "claude-haiku-4.5" }`
-routes heavy prompts to Sonnet and fast prompts to Haiku. This has no effect across
-families.
+if your anchor is Claude, `{ reasoning: ["claude-sonnet-4.6"], noReasoning: ["claude-haiku-4.5"] }`
+routes heavy prompts to Sonnet and fast prompts to Haiku. These options have no effect
+across families (see the cross-family note above).
 
 ## First-party gating
 

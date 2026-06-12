@@ -64,40 +64,26 @@ type RouterDecision = {
 }
 
 type Options = {
-  // General preference: nudge which model is used regardless of reasoning label.
-  // Accepts a model key (e.g. "claude-sonnet-4.6") or API id.
-  preferredModel?: string
+  // Ordered list of preferred model keys or API ids to use as the session anchor
+  // and routing fallback, regardless of routing label.
   preferredModels?: string[]
-  // Per-label preferences: override candidate selection for a specific routing verdict.
-  // Accepts a model key / API id, or an ordered list of them.
-  // Note: only within-family candidates are valid (the auto model has a single endpoint).
-  // Cross-family entries are logged and skipped.
-  reasoning?: string | string[]
-  noReasoning?: string | string[]
+  // Per-label preference lists: steer candidate selection per routing verdict.
+  // Only within-family candidates are valid (the auto model has a single endpoint).
+  // Cross-family entries are silently skipped.
+  reasoning?: string[]
+  noReasoning?: string[]
 }
 
 function pickTemplate(models: Record<string, Model>) {
   return Object.values(models).find((m) => m.providerID === PROVIDER_ID)
 }
 
-function normalizeTokenList(value: string | string[] | undefined): string[] {
-  const raw = Array.isArray(value) ? value : value !== undefined ? [value] : []
+function normalizeList(values: string[] | undefined): string[] {
+  if (!values?.length) return []
   const deduped: string[] = []
-  for (const token of raw) {
-    const v = token.trim()
-    if (v && !deduped.includes(v)) deduped.push(v)
-  }
-  return deduped
-}
-
-function normalizePreferred(options?: Options): string[] {
-  const ordered = [options?.preferredModel, ...(options?.preferredModels ?? [])]
-  const deduped: string[] = []
-  for (const raw of ordered) {
-    if (typeof raw !== "string") continue
-    const value = raw.trim()
-    if (!value || deduped.includes(value)) continue
-    deduped.push(value)
+  for (const v of values) {
+    const s = v.trim()
+    if (s && !deduped.includes(s)) deduped.push(s)
   }
   return deduped
 }
@@ -399,9 +385,9 @@ function withAutoModel(models: Record<string, Model>, selected?: Model) {
 
 const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
   const opts = (options ?? {}) as Options
-  const preferred = normalizePreferred(opts)
-  const reasoningTokens = normalizeTokenList(opts.reasoning)
-  const noReasoningTokens = normalizeTokenList(opts.noReasoning)
+  const preferred = normalizeList(opts.preferredModels)
+  const reasoningList = normalizeList(opts.reasoning)
+  const noReasoningList = normalizeList(opts.noReasoning)
   let preferredApiIDs: string[] = []
   let reasoningApiIDs: string[] = []
   let noReasoningApiIDs: string[] = []
@@ -539,8 +525,8 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
       async models(provider, ctx) {
         autoKnownModels = Object.values(provider.models)
         preferredApiIDs = resolvePreferredApiIDs(provider.models, preferred)
-        reasoningApiIDs = resolvePreferredApiIDs(provider.models, reasoningTokens)
-        noReasoningApiIDs = resolvePreferredApiIDs(provider.models, noReasoningTokens)
+        reasoningApiIDs = resolvePreferredApiIDs(provider.models, reasoningList)
+        noReasoningApiIDs = resolvePreferredApiIDs(provider.models, noReasoningList)
         let template = pickTemplate(provider.models)
         const preferredTemplate = preferredApiIDs.map(modelByApiId).find((model): model is Model => !!model)
         if (preferredTemplate) {
