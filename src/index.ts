@@ -107,7 +107,7 @@ function withAutoModel(models: Record<string, Model>, selected?: Model) {
     ...models,
     [MODEL_ID]: {
       ...template,
-      id: template.id,
+      id: MODEL_ID,
       name: `Auto → ${template.name}`,
       family: "github-copilot-auto",
       variants: undefined,

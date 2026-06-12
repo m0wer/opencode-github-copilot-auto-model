@@ -65,7 +65,7 @@ async function callChatParams(models: Record<string, unknown>) {
     {
       sessionID: "ses_test",
       agent: "build",
-      model: { ...resolved.auto, id: "auto" },
+      model: resolved.auto,
       provider: { source: "config", info: {} as never, options: {} },
       message: {} as never,
     },
@@ -78,7 +78,7 @@ describe("opencode-github-copilot-auto-model", () => {
   test("uses first available copilot model when no auto session is available", async () => {
     const models = await callHook({ "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex })
     expect(models.auto).toBeDefined()
-    expect(models.auto.id).toBe("claude-sonnet-4.6")
+    expect(models.auto.id).toBe("auto")
     expect(models.auto.api.id).toBe("claude-sonnet-4-6-20250929")
     expect(models.auto.api.npm).toBe("@ai-sdk/anthropic")
     expect(models.auto.name).toBe("Auto → Claude Sonnet 4.6")
@@ -91,7 +91,7 @@ describe("opencode-github-copilot-auto-model", () => {
 
   test("falls back to another available copilot model", async () => {
     const models = await callHook({ "claude-sonnet-4.6": sonnet, "claude-haiku-4.5": haiku })
-    expect(models.auto.id).toBe("claude-sonnet-4.6")
+    expect(models.auto.id).toBe("auto")
     expect(models.auto.api.id).toBe("claude-sonnet-4-6-20250929")
     expect(models.auto.api.npm).toBe("@ai-sdk/anthropic")
     expect(models.auto.name).toBe("Auto → Claude Sonnet 4.6")
@@ -99,7 +99,7 @@ describe("opencode-github-copilot-auto-model", () => {
 
   test("falls back to claude-haiku-4.5 as last resort", async () => {
     const models = await callHook({ "claude-haiku-4.5": haiku })
-    expect(models.auto.id).toBe("claude-haiku-4.5")
+    expect(models.auto.id).toBe("auto")
     expect(models.auto.api.id).toBe("claude-haiku-4-5-20251001")
     expect(models.auto.name).toBe("Auto → Claude Haiku 4.5")
   })
