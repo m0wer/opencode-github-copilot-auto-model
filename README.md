@@ -24,6 +24,23 @@ Add to `~/.config/opencode/opencode.json`:
 }
 ```
 
+opencode runs on Bun and loads the plugin straight from its TypeScript source (the
+entry has no third-party runtime imports), so no build step is needed for the
+`github:` install.
+
+For local development you can point opencode at a checkout instead. Either build a
+bundle and reference it directly:
+
+```jsonc
+{
+  "plugin": [
+    "/absolute/path/to/opencode-github-copilot-auto-model/dist/index.js"
+  ]
+}
+```
+
+(run `bun run build` first), or drop `src/index.ts` into `~/.config/opencode/plugins/`.
+
 Optional configuration (all settings are optional; Copilot session + intent routing
 always runs regardless):
 
