@@ -25,8 +25,7 @@ Add to `~/.config/opencode/opencode.json`:
 ```
 
 The unpinned spec tracks the default branch. To pin a release, append the git ref
-with `#` (a hash, **not** `@`, which opencode/Bun cannot resolve for `github:`
-specs):
+with `#` (not `@`):
 
 ```jsonc
 {
@@ -36,13 +35,20 @@ specs):
 }
 ```
 
-opencode runs on Bun and loads the plugin straight from its TypeScript source (the
-entry has no third-party runtime imports), so no build step is needed for the
-`github:` install.
+opencode loads the plugin straight from its TypeScript source and the package
+declares no install-time dependencies (the `@opencode-ai/*` imports are types
+only, erased at runtime), so the `github:` install is a single fast package
+fetch with no build step.
 
-> **If a `github:` plugin won't load after changing its spec or pushing a fix,**
-> opencode caches installs under `~/.cache/opencode/packages/`. Remove the stale
-> entry (e.g. `rm -rf ~/.cache/opencode/packages/github:m0wer`) and restart
+> **Why no dependencies?** opencode installs `github:` plugins with npm's
+> arborist, which auto-installs `dependencies` and `peerDependencies` (plus their
+> whole transitive tree) on every startup. That installer is short-lived and
+> re-runs each boot, so a heavy tree never finishes downloading and the plugin
+> silently fails to load. Keeping the runtime dependency set empty avoids that.
+>
+> **If a `github:` plugin still won't load** after changing its spec or pushing a
+> fix, opencode caches installs under `~/.cache/opencode/packages/`. Remove the
+> stale entry (e.g. `rm -rf ~/.cache/opencode/packages/github:m0wer`) and restart
 > opencode to force a clean reinstall.
 
 For local development you can point opencode at a checkout instead. Either build a
