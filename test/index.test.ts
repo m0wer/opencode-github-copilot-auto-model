@@ -1,4 +1,8 @@
+import { execFileSync } from "node:child_process"
+import { existsSync } from "node:fs"
+import path from "node:path"
 import { describe, expect, test } from "bun:test"
+import pkg from "../package.json"
 import plugin from "../src/index"
 
 const makeModel = (id: string, apiId: string, npm: string, url: string, name: string) => ({
@@ -242,5 +246,37 @@ describe("opencode-github-copilot-auto-model", () => {
       },
     )
     expect(output.options.model).toBe("claude-sonnet-4-6-20250929")
+  })
+})
+
+// Regression guard for the GitHub install path: opencode (Bun) loads the plugin via
+// the package entry. `dist/` is gitignored, so a `github:` install only ships the
+// files committed to git. The entry must therefore resolve to a committed source
+// file, otherwise the plugin registers but never runs (the bug this guards against).
+describe("packaging", () => {
+  const root = path.join(import.meta.dir, "..")
+  const entry = (pkg as { exports?: { ["."]?: { import?: string } }; main?: string }).exports?.["."]?.import ?? pkg.main
+  const rel = (entry ?? "").replace(/^\.\//, "")
+
+  test("declares a package entry", () => {
+    expect(rel.length).toBeGreaterThan(0)
+  })
+
+  test("entry file exists on disk", () => {
+    expect(existsSync(path.join(root, rel))).toBe(true)
+  })
+
+  test("entry is tracked by git so a github install can resolve it", () => {
+    try {
+      execFileSync("git", ["ls-files", "--error-unmatch", rel], {
+        cwd: root,
+        stdio: ["ignore", "pipe", "pipe"],
+      })
+    } catch (error) {
+      // No git binary (e.g. running from an extracted tarball): the existence check
+      // above is sufficient. Only fail when git is present and the file is untracked.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return
+      throw new Error(`package entry "${rel}" is not tracked by git; a github: install would fail to load it`)
+    }
   })
 })
