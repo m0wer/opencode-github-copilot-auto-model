@@ -279,4 +279,22 @@ describe("packaging", () => {
       throw new Error(`package entry "${rel}" is not tracked by git; a github: install would fail to load it`)
     }
   })
+
+  // opencode installs `github:` plugins with @npmcli/arborist, which auto-installs
+  // `dependencies` AND `peerDependencies` (plus their transitive trees) on every
+  // startup. opencode's installer is short-lived/interruptible and re-runs each boot
+  // (its cache check never matches a github spec), so a heavy tree never finishes
+  // downloading and the plugin silently fails to load. The plugin imports
+  // @opencode-ai/* as types only (erased at runtime) and uses Node builtins, so it
+  // must declare zero install-time deps to keep the github install a single fast
+  // package fetch. Keep type packages in devDependencies for local type-checking.
+  const manifest = pkg as { dependencies?: Record<string, string>; peerDependencies?: Record<string, string> }
+
+  test("declares no runtime dependencies (keeps the github install minimal)", () => {
+    expect(Object.keys(manifest.dependencies ?? {})).toEqual([])
+  })
+
+  test("declares no peer dependencies (arborist would auto-install their full tree)", () => {
+    expect(Object.keys(manifest.peerDependencies ?? {})).toEqual([])
+  })
 })

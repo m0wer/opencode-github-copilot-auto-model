@@ -22,10 +22,6 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
-  "peerDependencies": {
-    "@opencode-ai/plugin": "*",
-    "@opencode-ai/sdk": "*"
-  },
   "devDependencies": {
     "@opencode-ai/plugin": "*",
     "@opencode-ai/sdk": "*",
