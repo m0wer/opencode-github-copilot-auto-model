@@ -14,45 +14,14 @@ opencode and adds the model to the picker as **`Auto`**.
 
 ## Install
 
-Add to `~/.config/opencode/opencode.json`:
+Clone the repo, build the bundle, and point opencode at it by absolute path in
+`~/.config/opencode/opencode.json`:
 
-```jsonc
-{
-  "plugin": [
-    "github:m0wer/opencode-github-copilot-auto-model"
-  ]
-}
+```sh
+git clone https://github.com/m0wer/opencode-github-copilot-auto-model
+cd opencode-github-copilot-auto-model
+bun install && bun run build   # produces dist/index.js
 ```
-
-The unpinned spec tracks the default branch. To pin a release, append the git ref
-with `#` (not `@`):
-
-```jsonc
-{
-  "plugin": [
-    "github:m0wer/opencode-github-copilot-auto-model#v0.1.0"
-  ]
-}
-```
-
-opencode loads the plugin straight from its TypeScript source and the package
-declares no install-time dependencies (the `@opencode-ai/*` imports are types
-only, erased at runtime), so the `github:` install is a single fast package
-fetch with no build step.
-
-> **Why no dependencies?** opencode installs `github:` plugins with npm's
-> arborist, which auto-installs `dependencies` and `peerDependencies` (plus their
-> whole transitive tree) on every startup. That installer is short-lived and
-> re-runs each boot, so a heavy tree never finishes downloading and the plugin
-> silently fails to load. Keeping the runtime dependency set empty avoids that.
->
-> **If a `github:` plugin still won't load** after changing its spec or pushing a
-> fix, opencode caches installs under `~/.cache/opencode/packages/`. Remove the
-> stale entry (e.g. `rm -rf ~/.cache/opencode/packages/github:m0wer`) and restart
-> opencode to force a clean reinstall.
-
-For local development you can point opencode at a checkout instead. Either build a
-bundle and reference it directly:
 
 ```jsonc
 {
@@ -62,7 +31,19 @@ bundle and reference it directly:
 }
 ```
 
-(run `bun run build` first), or drop `src/index.ts` into `~/.config/opencode/plugins/`.
+Alternatively, drop `src/index.ts` into `~/.config/opencode/plugins/` (opencode
+loads `.ts` plugins from that directory directly; no build needed).
+
+> **Why not `github:m0wer/...`?** It does not work with the current opencode.
+> opencode installs `github:` plugins by having npm's arborist **git-clone** the
+> repo on startup (`~/.cache/opencode/packages/<spec>/`). That clone takes ~4s,
+> but short-lived invocations (e.g. `opencode models`) dispose the instance before
+> it finishes, and arborist then **rolls back** the partial install (atomic
+> reify), leaving an empty cache dir. opencode also never cache-hits a `github:`
+> spec (`npm-package-arg` reports no package name), so it re-clones and loses the
+> race on every launch. A local path resolves with a cheap `stat` (no clone), so
+> it loads reliably. (Publishing to npm would also work — a tarball install has no
+> clone — but this project is intentionally not published.)
 
 Optional configuration (all settings are optional; Copilot session + intent routing
 always runs regardless):
@@ -71,7 +52,7 @@ always runs regardless):
 {
   "plugin": [
     [
-      "github:m0wer/opencode-github-copilot-auto-model",
+      "/absolute/path/to/opencode-github-copilot-auto-model/dist/index.js",
       {
         // Ordered list of preferred models; first match in the session pool wins.
         // Accepts model keys (e.g. "claude-sonnet-4.6") or API ids.

@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process"
 import { existsSync } from "node:fs"
 import path from "node:path"
 import { describe, expect, test } from "bun:test"
@@ -249,10 +248,13 @@ describe("opencode-github-copilot-auto-model", () => {
   })
 })
 
-// Regression guard for the GitHub install path: opencode (Bun) loads the plugin via
-// the package entry. `dist/` is gitignored, so a `github:` install only ships the
-// files committed to git. The entry must therefore resolve to a committed source
-// file, otherwise the plugin registers but never runs (the bug this guards against).
+// Packaging guards for the supported (local-path) install. opencode loads the
+// plugin from the file referenced in config: dist/index.js (after `bun run build`)
+// or src/index.ts dropped into ~/.config/opencode/plugins/. Either way opencode's
+// loader requires a default export of `{ id, server: <function> }`. (The `github:`
+// install path is intentionally unsupported: opencode git-clones the repo on every
+// launch and disposes short-lived commands before the clone finishes, so arborist
+// rolls the partial install back — a local path resolves with a cheap stat instead.)
 describe("packaging", () => {
   const root = path.join(import.meta.dir, "..")
   const entry = (pkg as { exports?: { ["."]?: { import?: string } }; main?: string }).exports?.["."]?.import ?? pkg.main
@@ -266,35 +268,10 @@ describe("packaging", () => {
     expect(existsSync(path.join(root, rel))).toBe(true)
   })
 
-  test("entry is tracked by git so a github install can resolve it", () => {
-    try {
-      execFileSync("git", ["ls-files", "--error-unmatch", rel], {
-        cwd: root,
-        stdio: ["ignore", "pipe", "pipe"],
-      })
-    } catch (error) {
-      // No git binary (e.g. running from an extracted tarball): the existence check
-      // above is sufficient. Only fail when git is present and the file is untracked.
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return
-      throw new Error(`package entry "${rel}" is not tracked by git; a github: install would fail to load it`)
-    }
-  })
-
-  // opencode installs `github:` plugins with @npmcli/arborist, which auto-installs
-  // `dependencies` AND `peerDependencies` (plus their transitive trees) on every
-  // startup. opencode's installer is short-lived/interruptible and re-runs each boot
-  // (its cache check never matches a github spec), so a heavy tree never finishes
-  // downloading and the plugin silently fails to load. The plugin imports
-  // @opencode-ai/* as types only (erased at runtime) and uses Node builtins, so it
-  // must declare zero install-time deps to keep the github install a single fast
-  // package fetch. Keep type packages in devDependencies for local type-checking.
-  const manifest = pkg as { dependencies?: Record<string, string>; peerDependencies?: Record<string, string> }
-
-  test("declares no runtime dependencies (keeps the github install minimal)", () => {
-    expect(Object.keys(manifest.dependencies ?? {})).toEqual([])
-  })
-
-  test("declares no peer dependencies (arborist would auto-install their full tree)", () => {
-    expect(Object.keys(manifest.peerDependencies ?? {})).toEqual([])
+  test("default export has the shape opencode loads (id + server function)", () => {
+    expect(typeof plugin).toBe("object")
+    expect(typeof plugin.id).toBe("string")
+    expect(plugin.id.length).toBeGreaterThan(0)
+    expect(typeof plugin.server).toBe("function")
   })
 })
