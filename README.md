@@ -24,9 +24,26 @@ Add to `~/.config/opencode/opencode.json`:
 }
 ```
 
+The unpinned spec tracks the default branch. To pin a release, append the git ref
+with `#` (a hash, **not** `@`, which opencode/Bun cannot resolve for `github:`
+specs):
+
+```jsonc
+{
+  "plugin": [
+    "github:m0wer/opencode-github-copilot-auto-model#v0.1.0"
+  ]
+}
+```
+
 opencode runs on Bun and loads the plugin straight from its TypeScript source (the
 entry has no third-party runtime imports), so no build step is needed for the
 `github:` install.
+
+> **If a `github:` plugin won't load after changing its spec or pushing a fix,**
+> opencode caches installs under `~/.cache/opencode/packages/`. Remove the stale
+> entry (e.g. `rm -rf ~/.cache/opencode/packages/github:m0wer`) and restart
+> opencode to force a clean reinstall.
 
 For local development you can point opencode at a checkout instead. Either build a
 bundle and reference it directly:
