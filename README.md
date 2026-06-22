@@ -14,36 +14,23 @@ opencode and adds the model to the picker as **`Auto`**.
 
 ## Install
 
-Clone the repo, build the bundle, and point opencode at it by absolute path in
-`~/.config/opencode/opencode.json`:
-
-```sh
-git clone https://github.com/m0wer/opencode-github-copilot-auto-model
-cd opencode-github-copilot-auto-model
-bun install && bun run build   # produces dist/index.js
-```
+Add the package name to `~/.config/opencode/opencode.json`:
 
 ```jsonc
 {
   "plugin": [
-    "/absolute/path/to/opencode-github-copilot-auto-model/dist/index.js"
+    "opencode-github-copilot-auto-model"
   ]
 }
 ```
 
-Alternatively, drop `src/index.ts` into `~/.config/opencode/plugins/` (opencode
-loads `.ts` plugins from that directory directly; no build needed).
+opencode will install it automatically from npm on first run.
 
-> **Why not `github:m0wer/...`?** It does not work with the current opencode.
-> opencode installs `github:` plugins by having npm's arborist **git-clone** the
-> repo on startup (`~/.cache/opencode/packages/<spec>/`). That clone takes ~4s,
-> but short-lived invocations (e.g. `opencode models`) dispose the instance before
-> it finishes, and arborist then **rolls back** the partial install (atomic
-> reify), leaving an empty cache dir. opencode also never cache-hits a `github:`
-> spec (`npm-package-arg` reports no package name), so it re-clones and loses the
-> race on every launch. A local path resolves with a cheap `stat` (no clone), so
-> it loads reliably. (Publishing to npm would also work — a tarball install has no
-> clone — but this project is intentionally not published.)
+> **Why not `github:m0wer/...`?** opencode installs `github:` plugins by having
+> npm's arborist git-clone the repo on startup. That clone takes ~4s, but
+> short-lived invocations (e.g. `opencode models`) dispose the instance before it
+> finishes, so arborist rolls back the partial install and the cache is left empty
+> on every launch. An npm tarball install has no clone and loads reliably.
 
 Optional configuration (all settings are optional; Copilot session + intent routing
 always runs regardless):
@@ -52,7 +39,7 @@ always runs regardless):
 {
   "plugin": [
     [
-      "/absolute/path/to/opencode-github-copilot-auto-model/dist/index.js",
+      "opencode-github-copilot-auto-model",
       {
         // Ordered list of preferred models; first match in the session pool wins.
         // Accepts model keys (e.g. "claude-sonnet-4.6") or API ids.
@@ -190,4 +177,31 @@ bun install
 bun test
 bun run typecheck
 bun run build
+```
+
+## Publishing
+
+Publishing is automated via GitHub Actions on every `v*` tag. To release a new version:
+
+1. Bump the version in `package.json`.
+2. Commit and tag:
+   ```sh
+   git add package.json
+   git commit -m "chore: release v0.x.y"
+   git tag v0.x.y
+   git push origin main --tags
+   ```
+3. The `publish` workflow builds, tests, and pushes to npm automatically.
+
+The workflow requires an `NPM_TOKEN` secret in the repository settings (Settings >
+Secrets > Actions). Generate a token at https://www.npmjs.com/settings/m0wer/tokens
+with "Automation" type and add it as `NPM_TOKEN`.
+
+### Manual publish
+
+If you need to publish locally:
+
+```sh
+bun run prepublishOnly   # typecheck + test + build
+npm publish
 ```
