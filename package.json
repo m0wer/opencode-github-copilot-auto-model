@@ -19,7 +19,8 @@
     "dev": "bun build ./src/index.ts --outfile ./dist/index.js --target node --format esm --external @opencode-ai/plugin --external @opencode-ai/sdk --watch",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "prepublishOnly": "bun run typecheck && bun test && bun run build"
+    "prepublishOnly": "bun run typecheck && bun test && bun run build",
+    "release": "npm login --auth-type=web && npm publish"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "*",

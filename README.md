@@ -181,7 +181,8 @@ bun run build
 
 ## Publishing
 
-Publishing is automated via GitHub Actions on every `v*` tag. To release a new version:
+Publishing is done locally using npm's browser-based OAuth login (no long-lived
+tokens required).
 
 1. Bump the version in `package.json`.
 2. Commit and tag:
@@ -189,19 +190,17 @@ Publishing is automated via GitHub Actions on every `v*` tag. To release a new v
    git add package.json
    git commit -m "chore: release v0.x.y"
    git tag v0.x.y
-   git push origin main --tags
    ```
-3. The `publish` workflow builds, tests, and pushes to npm automatically.
-
-The workflow requires an `NPM_TOKEN` secret in the repository settings (Settings >
-Secrets > Actions). Generate a token at https://www.npmjs.com/settings/m0wer/tokens
-with "Automation" type and add it as `NPM_TOKEN`.
-
-### Manual publish
-
-If you need to publish locally:
-
-```sh
-bun run prepublishOnly   # typecheck + test + build
-npm publish
-```
+3. Log in to npm (opens a browser tab for one-time OAuth):
+   ```sh
+   npm login --auth-type=web
+   ```
+4. Build and publish:
+   ```sh
+   npm run prepublishOnly   # typecheck + test + build
+   npm publish
+   ```
+5. Push the commit and tag:
+   ```sh
+   git push origin master --tags
+   ```
