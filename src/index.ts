@@ -50,6 +50,7 @@ type ConvState = {
   routedModelID?: string
   routedLabel?: "needs_reasoning" | "no_reasoning"
   needsReEval?: boolean
+  omitSessionToken?: boolean
   previousModel?: string
   turn: number
 }
@@ -63,6 +64,14 @@ type RouterDecision = {
   sticky_override?: boolean
 }
 
+type AutoConfig = {
+  id?: string
+  name?: string
+  preferredModels?: string[]
+  reasoning?: string[]
+  noReasoning?: string[]
+}
+
 type Options = {
   // Ordered list of preferred model keys or API ids to use as the session anchor
   // and routing fallback, regardless of routing label.
@@ -72,10 +81,47 @@ type Options = {
   // Cross-family entries are silently skipped.
   reasoning?: string[]
   noReasoning?: string[]
+  // Additional injected autos. Each one anchors independently based on its own
+  // preferred model list and keeps its own routing/session cache.
+  autos?: AutoConfig[]
+}
+
+type AutoDraft = {
+  requestedID?: string
+  requestedName?: string
+  preferredModels: string[]
+  reasoning: string[]
+  noReasoning: string[]
+  legacy: boolean
+  index: number
+}
+
+type TemplateAPI = {
+  id: string
+  npm: string
+  url: string
+}
+
+type InjectedAuto = {
+  id: string
+  name: string
+  preferredModels: string[]
+  reasoning: string[]
+  noReasoning: string[]
+  preferredApiIDs: string[]
+  reasoningApiIDs: string[]
+  noReasoningApiIDs: string[]
+  template?: Model
+  templateApi?: TemplateAPI
+  catalogDefaultModelID?: string
 }
 
 function pickTemplate(models: Record<string, Model>) {
   return Object.values(models).find((m) => m.providerID === PROVIDER_ID)
+}
+
+function templateAPI(model: Model): TemplateAPI {
+  return { id: model.api.id, npm: model.api.npm, url: model.api.url }
 }
 
 function normalizeList(values: string[] | undefined): string[] {
@@ -103,6 +149,88 @@ function resolvePreferredApiIDs(models: Record<string, Model>, preferred: string
   return resolved
 }
 
+function autoDrafts(options: Options): AutoDraft[] {
+  const drafts: AutoDraft[] = [
+    {
+      requestedID: MODEL_ID,
+      requestedName: "Auto",
+      preferredModels: normalizeList(options.preferredModels),
+      reasoning: normalizeList(options.reasoning),
+      noReasoning: normalizeList(options.noReasoning),
+      legacy: true,
+      index: 0,
+    },
+  ]
+  for (const [index, auto] of (options.autos ?? []).entries()) {
+    drafts.push({
+      requestedID: auto.id?.trim() || undefined,
+      requestedName: auto.name?.trim() || undefined,
+      preferredModels: normalizeList(auto.preferredModels),
+      reasoning: normalizeList(auto.reasoning),
+      noReasoning: normalizeList(auto.noReasoning),
+      legacy: false,
+      index: index + 1,
+    })
+  }
+  return drafts
+}
+
+function slugify(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+}
+
+function uniqueValue(base: string, used: Set<string>, suffix = "-"): string {
+  let value = base || "auto"
+  let counter = 2
+  while (used.has(value)) {
+    value = `${base}${suffix}${counter}`
+    counter += 1
+  }
+  used.add(value)
+  return value
+}
+
+function familyLabel(model?: Model): string | undefined {
+  if (!model) return undefined
+  const fingerprint = `${model.id} ${model.name} ${model.family} ${model.api.id}`.toLowerCase()
+  if (model.api.npm === "@ai-sdk/anthropic" || fingerprint.includes("claude")) return "Claude"
+  if (model.api.npm === "@ai-sdk/google" || fingerprint.includes("gemini")) return "Gemini"
+  if (
+    model.api.npm === "@ai-sdk/github-copilot" ||
+    model.api.npm === "@ai-sdk/openai" ||
+    fingerprint.includes("gpt") ||
+    fingerprint.includes("codex")
+  )
+    return "GPT"
+  if (fingerprint.includes("microsoft") || fingerprint.includes("mai") || fingerprint.includes("raptor"))
+    return "Microsoft"
+  if (model.family?.trim()) {
+    return model.family
+      .split(/[^a-zA-Z0-9]+/)
+      .filter(Boolean)
+      .map((part) => part[0].toUpperCase() + part.slice(1))
+      .join(" ")
+  }
+  const npm = model.api.npm.split("/").pop()?.replace(/^@/, "")
+  return npm ? npm[0].toUpperCase() + npm.slice(1) : undefined
+}
+
+function defaultAutoName(draft: AutoDraft, model?: Model): string {
+  if (draft.legacy) return "Auto"
+  const label = familyLabel(model)
+  return label ? `Auto ${label}` : `Auto ${draft.index}`
+}
+
+function defaultAutoID(draft: AutoDraft, model?: Model): string {
+  if (draft.legacy) return MODEL_ID
+  if (draft.requestedName) return slugify(draft.requestedName)
+  const label = familyLabel(model)
+  return label ? `auto-${slugify(label)}` : `auto-${draft.index}`
+}
+
 // File logger — avoids polluting the TUI.
 // Tail ~/.local/state/opencode-github-copilot-auto-model/plugin.log to observe.
 function logFile() {
@@ -119,30 +247,14 @@ function logFile() {
 let logReady: Promise<void> | undefined
 function log(msg: string) {
   const file = logFile()
-  if (!logReady) logReady = mkdir(path.dirname(file), { recursive: true }).then(() => undefined).catch(() => undefined)
+  logReady ??= mkdir(path.dirname(file), { recursive: true }).then(() => undefined).catch(() => undefined)
   void logReady.then(() => appendFile(file, `${new Date().toISOString()} info ${msg}\n`).catch(() => undefined))
 }
 
 // --- module state -----------------------------------------------------------------------
 // Auth/catalog-derived (same for every conversation):
 let autoBearer: string | undefined
-let autoBaseURL: string | undefined
 let autoKnownModels: Model[] = []
-let autoTemplateApi: { id: string; npm: string; url: string } | undefined
-// Availability default discovered when injecting the `auto` model; used as the
-// fallback model id when a conversation's own session fetch fails.
-let catalogDefaultModelID: string | undefined
-// Per-conversation state, keyed by opencode sessionID.
-const conversations = new Map<string, ConvState>()
-
-function getConv(sessionID: string): ConvState {
-  let conv = conversations.get(sessionID)
-  if (!conv) {
-    conv = { turn: 0 }
-    conversations.set(sessionID, conv)
-  }
-  return conv
-}
 
 function capiBase(url: string) {
   const clean = url.replace(/\/+$/, "")
@@ -232,28 +344,6 @@ async function fetchAutoSession(baseURL: string, bearer: string): Promise<AutoSe
   return { selectedModelID, sessionToken: data.session_token, availableModels, discountedCosts, expiresAtMs }
 }
 
-// Return a fresh-enough session for this conversation, fetching/refreshing as needed.
-// Called on every turn (chat.params/chat.headers), so tokens never go stale mid-conversation.
-// A refresh failure keeps the last-known session rather than dropping the token.
-async function ensureSession(sessionID: string): Promise<AutoSession | undefined> {
-  if (!autoBearer || !autoBaseURL) return undefined
-  const conv = getConv(sessionID)
-  if (conv.session && Date.now() < conv.session.expiresAtMs - SESSION_REFRESH_SKEW_MS) return conv.session
-  if (!conv.sessionInflight) {
-    const baseURL = autoBaseURL
-    const bearer = autoBearer
-    conv.sessionInflight = fetchAutoSession(baseURL, bearer)
-      .then((session) => {
-        if (session) conv.session = session
-        return conv.session
-      })
-      .finally(() => {
-        conv.sessionInflight = undefined
-      })
-  }
-  return conv.sessionInflight
-}
-
 // POST /models/session/intent — the router. This is the only call that sees the
 // prompt; it returns a ranked candidate list. Gated to first-party clients via
 // Copilot-Integration-Id, so without that header it may 404 (logged for inspection).
@@ -299,11 +389,11 @@ function modelByApiId(apiId: string): Model | undefined {
   return autoKnownModels.find((m) => m.providerID === PROVIDER_ID && m.api.id === apiId)
 }
 
-function isSameFamily(apiId: string | undefined): boolean {
-  if (!apiId || !autoTemplateApi) return false
-  if (apiId === autoTemplateApi.id) return true
+function isSameFamily(apiId: string | undefined, templateApi?: TemplateAPI): boolean {
+  if (!apiId || !templateApi) return false
+  if (apiId === templateApi.id) return true
   const model = modelByApiId(apiId)
-  return !!model && model.api.npm === autoTemplateApi.npm && model.api.url === autoTemplateApi.url
+  return !!model && model.api.npm === templateApi.npm && model.api.url === templateApi.url
 }
 
 // Models of a given SDK family present in the auto pool. The within-family router needs
@@ -316,8 +406,8 @@ function poolFamilyCount(npm: string, url: string, pool: string[]): number {
 }
 
 // Mirror VS Code's provider-stickiness: take the first candidate in our endpoint family.
-function pickSameFamilyCandidate(candidates: string[], preferredApiIDs: string[]): string | undefined {
-  const sameFamily = candidates.filter((candidate) => isSameFamily(candidate))
+function pickSameFamilyCandidate(candidates: string[], preferredApiIDs: string[], templateApi?: TemplateAPI): string | undefined {
+  const sameFamily = candidates.filter((candidate) => isSameFamily(candidate, templateApi))
   if (!sameFamily.length) return undefined
   for (const preferred of preferredApiIDs) {
     if (sameFamily.includes(preferred)) return preferred
@@ -329,13 +419,13 @@ function pickSameFamilyCandidate(candidates: string[], preferredApiIDs: string[]
 // is the first model in the session pool (available_models) that resolves to a known
 // endpoint — in our case, the first one in the anchored family. VS Code derives the
 // default purely from available_models and never reads the undocumented selected_model.
-function defaultPoolModel(pool: string[]): string | undefined {
-  return pool.find((id) => isSameFamily(id))
+function defaultPoolModel(pool: string[], templateApi?: TemplateAPI): string | undefined {
+  return pool.find((id) => isSameFamily(id, templateApi))
 }
 
-function preferredPoolModel(pool: string[], preferredApiIDs: string[]): string | undefined {
+function preferredPoolModel(pool: string[], preferredApiIDs: string[], templateApi?: TemplateAPI): string | undefined {
   for (const preferred of preferredApiIDs) {
-    if (pool.includes(preferred) && isSameFamily(preferred)) return preferred
+    if (pool.includes(preferred) && isSameFamily(preferred, templateApi)) return preferred
   }
   return undefined
 }
@@ -352,45 +442,100 @@ function reasoningOptions(apiId: string, label: ConvState["routedLabel"]): Recor
     // Anthropic SDK uses an extended-thinking budget (opencode uses 16000 for "high").
     return { thinking: { type: "enabled", budgetTokens: 16000 } }
   }
-  // OpenAI / Copilot / OpenAI-compatible use reasoning_effort. Match opencode's copilot
-  // variant extras for GPT (opencode strips them automatically on completion-style URLs).
-  return model.id.toLowerCase().includes("claude")
-    ? { reasoningEffort: "high" }
-    : { reasoningEffort: "high", reasoningSummary: "auto", include: ["reasoning.encrypted_content"] }
+  if (model.api.npm === "@ai-sdk/github-copilot" || model.api.npm === "@ai-sdk/openai") {
+    // Match opencode's GPT/Copilot reasoning extras.
+    return { reasoningEffort: "high", reasoningSummary: "auto", include: ["reasoning.encrypted_content"] }
+  }
+  return undefined
 }
 
-function withAutoModel(models: Record<string, Model>, selected?: Model) {
-  if (models[MODEL_ID]) return models
-  const template = selected ?? pickTemplate(models)
-  if (!template) return models
+function configuredLabelForModel(auto: InjectedAuto, apiId: string): ConvState["routedLabel"] | undefined {
+  if (auto.reasoningApiIDs.includes(apiId)) return "needs_reasoning"
+  if (auto.noReasoningApiIDs.includes(apiId)) return "no_reasoning"
+  return undefined
+}
 
-  // Copy the template's api (id, npm, url) exactly — they already point to the right endpoint.
-  // Claude models: url="…/v1" + npm="@ai-sdk/anthropic" → appends /messages → correct.
-  // GPT models:   url="…"    + npm="@ai-sdk/github-copilot" → appends /chat/completions → correct.
-  // Do NOT strip /v1 from the url; the Anthropic SDK appends /messages (not /v1/messages).
-  log(`injected auto → ${template.id} (api.id=${template.api.id}, npm=${template.api.npm}, url=${template.api.url})`)
-  return {
-    ...models,
-    [MODEL_ID]: {
+function configuredModelForLabel(auto: InjectedAuto, label: ConvState["routedLabel"]): string | undefined {
+  const labelPrefs =
+    label === "needs_reasoning" ? auto.reasoningApiIDs
+    : label === "no_reasoning" ? auto.noReasoningApiIDs
+    : []
+  for (const preferred of labelPrefs) {
+    if (isSameFamily(preferred, auto.templateApi)) return preferred
+  }
+  for (const preferred of auto.preferredApiIDs) {
+    if (isSameFamily(preferred, auto.templateApi)) return preferred
+  }
+  return auto.catalogDefaultModelID ?? auto.templateApi?.id
+}
+
+function withAutoModels(models: Record<string, Model>, autos: InjectedAuto[]) {
+  const injected = { ...models }
+  for (const auto of autos) {
+    const template = auto.template ?? pickTemplate(models)
+    if (!template) continue
+    if (injected[auto.id]) {
+      if (auto.id !== MODEL_ID) log(`skip inject ${auto.id}: model id already exists`)
+      continue
+    }
+
+    // Copy the template's api (id, npm, url) exactly — they already point to the right endpoint.
+    // Claude models: url="…/v1" + npm="@ai-sdk/anthropic" → appends /messages → correct.
+    // GPT models:   url="…"    + npm="@ai-sdk/github-copilot" → appends /chat/completions → correct.
+    // Do NOT strip /v1 from the url; the Anthropic SDK appends /messages (not /v1/messages).
+    log(`injected ${auto.id} (${auto.name}) -> ${template.id} (api.id=${template.api.id}, npm=${template.api.npm}, url=${template.api.url})`)
+    injected[auto.id] = {
       ...template,
-      // Stable picker id (upstream): the override fires off `incoming.model.id === "auto"`.
-      id: MODEL_ID,
-      // Static label — the per-turn routing decision is surfaced as a transient toast.
-      name: "Auto",
+      id: auto.id,
+      name: auto.name,
       family: "github-copilot-auto",
       variants: undefined,
-    },
+    }
   }
+  return injected
 }
 
 const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
   const opts = (options ?? {}) as Options
-  const preferred = normalizeList(opts.preferredModels)
-  const reasoningList = normalizeList(opts.reasoning)
-  const noReasoningList = normalizeList(opts.noReasoning)
-  let preferredApiIDs: string[] = []
-  let reasoningApiIDs: string[] = []
-  let noReasoningApiIDs: string[] = []
+  const drafts = autoDrafts(opts)
+  const conversations = new Map<string, Map<string, ConvState>>()
+  let injectedAutos: InjectedAuto[] = []
+  let injectedAutoByID = new Map<string, InjectedAuto>()
+
+  function getConv(sessionID: string, autoID: string): ConvState {
+    let sessionAutos = conversations.get(sessionID)
+    if (!sessionAutos) {
+      sessionAutos = new Map<string, ConvState>()
+      conversations.set(sessionID, sessionAutos)
+    }
+    let conv = sessionAutos.get(autoID)
+    if (!conv) {
+      conv = { turn: 0 }
+      sessionAutos.set(autoID, conv)
+    }
+    return conv
+  }
+
+  async function ensureSession(sessionID: string, autoID: string): Promise<AutoSession | undefined> {
+    const auto = injectedAutoByID.get(autoID)
+    if (!autoBearer || !auto?.templateApi) return undefined
+    const conv = getConv(sessionID, autoID)
+    if (conv.session && Date.now() < conv.session.expiresAtMs - SESSION_REFRESH_SKEW_MS) return conv.session
+    if (!conv.sessionInflight) {
+      const baseURL = capiBase(auto.templateApi.url)
+      const bearer = autoBearer
+      conv.sessionInflight = fetchAutoSession(baseURL, bearer)
+        .then((session) => {
+          if (session) conv.session = session
+          return conv.session
+        })
+        .finally(() => {
+          conv.sessionInflight = undefined
+        })
+    }
+    return conv.sessionInflight
+  }
+
   // The status bar can't show the per-turn route, so surface it as a transient toast
   // whenever the model is (re)picked. Fire-and-forget; never let it break a turn.
   const toast = (message: string, variant: "info" | "success" | "warning" | "error") => {
@@ -405,9 +550,9 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
     // next turn (mirrors VS Code's invalidateRouterCache).
     event: async ({ event }) => {
       if (event.type !== "session.compacted") return
-      const conv = conversations.get(event.properties.sessionID)
-      if (conv) {
-        conv.needsReEval = true
+      const autos = conversations.get(event.properties.sessionID)
+      if (autos?.size) {
+        for (const conv of autos.values()) conv.needsReEval = true
         log(`route invalidated by compaction for ${event.properties.sessionID}`)
       }
     },
@@ -419,29 +564,75 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
         .map((p) => (p as { text?: string }).text ?? "")
         .join("\n")
         .trim()
-      const conv = getConv(input.sessionID)
-      conv.lastPrompt = text
-      conv.referenceCount = output.parts.filter((p) => p.type === "file").length
+      const references = output.parts.filter((p) => p.type === "file").length
+      let autos = conversations.get(input.sessionID)
+      if (!autos?.size) {
+        autos = new Map<string, ConvState>()
+        conversations.set(input.sessionID, autos)
+      }
+      for (const autoID of injectedAutoByID.keys()) {
+        const conv = getConv(input.sessionID, autoID)
+        conv.lastPrompt = text
+        conv.referenceCount = references
+      }
     },
     "chat.params": async (incoming, output) => {
       if (incoming.model.providerID !== PROVIDER_ID) return
-      if (incoming.model.id !== MODEL_ID) return
+      const auto = injectedAutoByID.get(incoming.model.id)
+      if (!auto) return
 
-      const conv = getConv(incoming.sessionID)
-      const session = await ensureSession(incoming.sessionID) // refresh token on the turn
+      const conv = getConv(incoming.sessionID, auto.id)
+      const session = await ensureSession(incoming.sessionID, auto.id) // refresh token on the turn
       // Default to the first same-family model in the pool (VS Code's _selectDefaultModel),
       // not the undocumented selected_model — kept only as a hint behind it. Everything here
-      // is clamped to the cloned endpoint's family (catalogDefaultModelID / autoTemplateApi.id
+      // is clamped to the cloned endpoint's family (catalogDefaultModelID / templateApi.id
       // always are; the session's selected pick may drift to another family).
       let decided =
-        preferredPoolModel(session?.availableModels ?? [], preferredApiIDs) ??
-        defaultPoolModel(session?.availableModels ?? []) ??
-        (isSameFamily(session?.selectedModelID) ? session?.selectedModelID : undefined) ??
-        catalogDefaultModelID ??
-        autoTemplateApi?.id
+        preferredPoolModel(session?.availableModels ?? [], auto.preferredApiIDs, auto.templateApi) ??
+        defaultPoolModel(session?.availableModels ?? [], auto.templateApi) ??
+        (isSameFamily(session?.selectedModelID, auto.templateApi) ? session?.selectedModelID : undefined) ??
+        auto.catalogDefaultModelID ??
+        auto.templateApi?.id
       const prompt = conv.lastPrompt
+      const sessionMissingConfiguredPrefs =
+        !!session && auto.preferredApiIDs.length > 0 && !auto.preferredApiIDs.some((id) => session.availableModels.includes(id))
+      if (sessionMissingConfiguredPrefs && auto.catalogDefaultModelID) {
+        let decision: RouterDecision | undefined
+        if (session.sessionToken && prompt && autoBearer && auto.templateApi && session.availableModels.length) {
+          const context = {
+            session_id: incoming.sessionID,
+            turn_number: conv.turn + 1,
+            previous_model: conv.previousModel,
+            reference_count: conv.referenceCount,
+            prompt_char_count: prompt.length,
+          }
+          decision = await getRouterDecision(
+            capiBase(auto.templateApi.url),
+            autoBearer,
+            session.sessionToken,
+            prompt,
+            session.availableModels,
+            context,
+          )
+        }
+        const routedLabel = decision?.predicted_label ?? configuredLabelForModel(auto, auto.catalogDefaultModelID)
+        decided = configuredModelForLabel(auto, routedLabel) ?? auto.catalogDefaultModelID
+        conv.omitSessionToken = true
+        if (decided !== conv.routedModelID || routedLabel !== conv.routedLabel) {
+          toast(
+            `${auto.name} → ${decided}${routedLabel ? ` · ${routedLabel}` : " · configured"}`,
+            routedLabel === "needs_reasoning" ? "success" : "info",
+          )
+        }
+        conv.routedModelID = decided
+        conv.routedLabel = routedLabel
+        conv.needsReEval = false
+        log(`session pool lacks configured models for ${auto.id}; using ${decided} without Copilot-Session-Token`)
+      } else {
+        conv.omitSessionToken = false
+      }
 
-      if (session?.sessionToken && prompt && autoBearer && autoBaseURL) {
+      if (session?.sessionToken && prompt && autoBearer && auto.templateApi && !sessionMissingConfiguredPrefs) {
         if (!session.availableModels.length) {
           log("intent skipped: session returned no available_models")
         } else if (conv.routedModelID !== undefined && !conv.needsReEval) {
@@ -458,7 +649,7 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
             prompt_char_count: prompt.length,
           }
           const decision = await getRouterDecision(
-            autoBaseURL,
+            capiBase(auto.templateApi.url),
             autoBearer,
             session.sessionToken,
             prompt,
@@ -470,24 +661,24 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
             // Use label-specific preferences when available; fall back to general list.
             const label = decision?.predicted_label
             const labelPrefs =
-              label === "needs_reasoning" ? reasoningApiIDs
-              : label === "no_reasoning" ? noReasoningApiIDs
-              : preferredApiIDs
-            const effectivePrefs = labelPrefs.length ? labelPrefs : preferredApiIDs
-            const sameFamily = pickSameFamilyCandidate(candidates, effectivePrefs)
+              label === "needs_reasoning" ? auto.reasoningApiIDs
+              : label === "no_reasoning" ? auto.noReasoningApiIDs
+              : auto.preferredApiIDs
+            const effectivePrefs = labelPrefs.length ? labelPrefs : auto.preferredApiIDs
+            const sameFamily = pickSameFamilyCandidate(candidates, effectivePrefs, auto.templateApi)
             if (sameFamily) {
               decided = sameFamily
               log(
                 `intent routed -> ${decided} (top=${candidates[0]}, label=${label}, confidence=${decision?.confidence})`,
               )
             } else {
-              log(`intent top=${candidates[0]} not same-family as ${autoTemplateApi?.id}; keeping ${decided}`)
+              log(`intent top=${candidates[0]} not same-family as ${auto.templateApi?.id}; keeping ${decided}`)
             }
           }
           if (decided && decided !== conv.routedModelID) {
             const reasoning = decision?.predicted_label === "needs_reasoning"
             toast(
-              `Auto → ${decided}${decision?.predicted_label ? ` · ${decision.predicted_label}` : ""}`,
+              `${auto.name} → ${decided}${decision?.predicted_label ? ` · ${decision.predicted_label}` : ""}`,
               reasoning ? "success" : "info",
             )
           }
@@ -499,10 +690,10 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
 
       conv.turn = conv.turn + 1
 
-      if (decided && decided !== MODEL_ID) {
+      if (decided && decided !== incoming.model.id) {
         output.options.model = decided
         conv.previousModel = decided
-        log(`chat.params override auto -> ${decided}`)
+        log(`chat.params override ${auto.id} -> ${decided}`)
         // Apply the routed reasoning effort every turn (sticky turns reuse routedLabel)
         // so it stays consistent with the model across the conversation.
         const effort = reasoningOptions(decided, conv.routedLabel)
@@ -514,64 +705,95 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
     },
     "chat.headers": async (incoming, output) => {
       if (incoming.model.providerID !== PROVIDER_ID) return
-      if (incoming.model.id !== MODEL_ID) return
-      const session = await ensureSession(incoming.sessionID)
+      const auto = injectedAutoByID.get(incoming.model.id)
+      if (!auto) return
+      const conv = getConv(incoming.sessionID, auto.id)
+      if (conv.omitSessionToken) return
+      const session = await ensureSession(incoming.sessionID, auto.id)
       if (!session?.sessionToken) return
       output.headers["Copilot-Session-Token"] = session.sessionToken
-      log("chat.headers added Copilot-Session-Token for auto")
+      log(`chat.headers added Copilot-Session-Token for ${auto.id}`)
     },
     provider: {
       id: PROVIDER_ID,
       async models(provider, ctx) {
         autoKnownModels = Object.values(provider.models)
-        preferredApiIDs = resolvePreferredApiIDs(provider.models, preferred)
-        reasoningApiIDs = resolvePreferredApiIDs(provider.models, reasoningList)
-        noReasoningApiIDs = resolvePreferredApiIDs(provider.models, noReasoningList)
-        let template = pickTemplate(provider.models)
-        const preferredTemplate = preferredApiIDs.map(modelByApiId).find((model): model is Model => !!model)
-        if (preferredTemplate) {
-          template = preferredTemplate
-          log(`preference anchor -> ${preferredTemplate.api.id}`)
-        }
+        autoBearer = ctx.auth?.type === "oauth" ? ctx.auth.refresh : undefined
+        const sessionCache = new Map<string, Promise<AutoSession | undefined>>()
+        const usedIDs = new Set<string>([...Object.keys(provider.models), MODEL_ID])
+        const usedNames = new Set<string>(["Auto"])
+        const resolvedAutos: InjectedAuto[] = []
 
-        if (template && ctx.auth?.type === "oauth") {
-          autoBaseURL = capiBase(template.api.url)
-          autoBearer = ctx.auth.refresh
-          // Catalog-level session only to choose the injected model's endpoint
-          // family + a fallback default; each conversation opens its own session.
-          const session = await fetchAutoSession(autoBaseURL, ctx.auth.refresh)
-          if (session) {
-            template = modelByApiId(session.selectedModelID) ?? template
-            const preferredInPool = preferredApiIDs.find((id) => session.availableModels.includes(id))
-            if (preferredInPool) {
-              const preferredModel = modelByApiId(preferredInPool)
-              if (preferredModel) {
-                template = preferredModel
-                log(`preference session pick -> ${preferredModel.api.id}`)
-              }
+        for (const draft of drafts) {
+          const preferredApiIDs = resolvePreferredApiIDs(provider.models, draft.preferredModels)
+          const reasoningApiIDs = resolvePreferredApiIDs(provider.models, draft.reasoning)
+          const noReasoningApiIDs = resolvePreferredApiIDs(provider.models, draft.noReasoning)
+          let template = pickTemplate(provider.models)
+          const preferredTemplate = preferredApiIDs.map(modelByApiId).find((model): model is Model => !!model)
+          if (preferredTemplate) {
+            template = preferredTemplate
+            log(`preference anchor${draft.legacy ? "" : ` (${draft.requestedName ?? draft.requestedID ?? draft.index})`} -> ${preferredTemplate.api.id}`)
+          }
+
+          if (template && ctx.auth?.type === "oauth") {
+            const baseURL = capiBase(template.api.url)
+            const sessionCacheKey = `${template.api.npm}\n${baseURL}`
+            let sessionPromise = sessionCache.get(sessionCacheKey)
+            if (!sessionPromise) {
+              // Catalog-level session only chooses the injected model's endpoint family
+              // + fallback default; each conversation still opens its own session.
+              sessionPromise = fetchAutoSession(baseURL, ctx.auth.refresh)
+              sessionCache.set(sessionCacheKey, sessionPromise)
             }
-            // Guard: if the selected model's family has no fast/strong pair in the pool,
-            // the within-family router can't do anything — anchor on a family that does
-            // (still a genuine Copilot auto model from the pool).
-            if (!preferredInPool && poolFamilyCount(template.api.npm, template.api.url, session.availableModels) < 2) {
-              const richer = session.availableModels
-                .map(modelByApiId)
-                .find((model) => model && poolFamilyCount(model.api.npm, model.api.url, session.availableModels) >= 2)
-              if (richer) {
-                log(`family guard: ${template.api.id}'s family has <2 pool models; anchoring on ${richer.api.id}`)
-                template = richer
+            const session = await sessionPromise
+            if (session) {
+              const preferredInPool = preferredApiIDs.find((id) => session.availableModels.includes(id))
+              if (preferredInPool) {
+                const preferredModel = modelByApiId(preferredInPool)
+                if (preferredModel) {
+                  template = preferredModel
+                  log(`preference session pick${draft.legacy ? "" : ` (${draft.requestedName ?? draft.requestedID ?? draft.index})`} -> ${preferredModel.api.id}`)
+                }
+              } else if (!preferredTemplate) {
+                template = modelByApiId(session.selectedModelID) ?? template
+              }
+              // Guard: if the selected model's family has no fast/strong pair in the pool,
+              // the within-family router can't do anything — anchor on a family that does
+              // (still a genuine Copilot auto model from the pool).
+              if (!preferredTemplate && !preferredInPool && poolFamilyCount(template.api.npm, template.api.url, session.availableModels) < 2) {
+                const richer = session.availableModels
+                  .map(modelByApiId)
+                  .find((model) => model && poolFamilyCount(model.api.npm, model.api.url, session.availableModels) >= 2)
+                if (richer) {
+                  log(`family guard: ${template.api.id}'s family has <2 pool models; anchoring on ${richer.api.id}`)
+                  template = richer
+                }
               }
             }
           }
+
+          const baseName = draft.requestedName || defaultAutoName(draft, template)
+          const baseID = draft.requestedID || defaultAutoID(draft, template)
+          const name = draft.legacy ? "Auto" : uniqueValue(baseName, usedNames, " ")
+          const id = draft.legacy ? MODEL_ID : uniqueValue(baseID, usedIDs)
+          resolvedAutos.push({
+            id,
+            name,
+            preferredModels: draft.preferredModels,
+            reasoning: draft.reasoning,
+            noReasoning: draft.noReasoning,
+            preferredApiIDs,
+            reasoningApiIDs,
+            noReasoningApiIDs,
+            template,
+            templateApi: template ? templateAPI(template) : undefined,
+            catalogDefaultModelID: template?.api.id,
+          })
         }
 
-        if (template) {
-          autoTemplateApi = { id: template.api.id, npm: template.api.npm, url: template.api.url }
-          // Fallback default for conversations whose own session fetch fails — keep it
-          // in the cloned endpoint's family.
-          catalogDefaultModelID = template.api.id
-        }
-        return withAutoModel(provider.models, template)
+        injectedAutos = resolvedAutos.filter((auto) => !!auto.template)
+        injectedAutoByID = new Map(injectedAutos.map((auto) => [auto.id, auto]))
+        return withAutoModels(provider.models, injectedAutos)
       },
     },
   }
