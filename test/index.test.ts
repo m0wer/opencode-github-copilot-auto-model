@@ -551,6 +551,127 @@ describe("opencode-github-copilot-auto-model", () => {
       globalThis.fetch = origFetch
     }
   })
+
+  test("keeps the missing-pool fallback route sticky across turns", async () => {
+    const origFetch = globalThis.fetch
+    // Session pool omits gemini, so the auto-gemini route takes the missing-pool
+    // fallback path. Each turn's router verdict differs; a sticky route must keep the
+    // first turn's model (KV cache stability) and not re-query the router.
+    const intents = [
+      { predicted_label: "no_reasoning", candidate_models: ["gpt-5.3-codex"], confidence: 0.9 },
+      { predicted_label: "needs_reasoning", candidate_models: ["gpt-5.3-codex"], confidence: 0.9 },
+    ]
+    let intentCalls = 0
+    globalThis.fetch = (async (url: string | URL | Request, _init?: RequestInit): Promise<Response> => {
+      const u = url.toString()
+      if (u.includes("/models/session/intent")) {
+        const payload = intents[Math.min(intentCalls, intents.length - 1)]
+        intentCalls += 1
+        return new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } })
+      }
+      if (u.includes("/models/session"))
+        return new Response(
+          JSON.stringify({
+            session_token: "test-session-token",
+            selected_model: "claude-sonnet-4-6-20250929",
+            available_models: ["claude-sonnet-4-6-20250929", "gpt-5.3-codex"],
+            expires_at: Math.floor(Date.now() / 1000) + 3600,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        )
+      return origFetch(url, _init)
+    }) as unknown as typeof fetch
+
+    try {
+      const hooks = await plugin.server(
+        { client: { tui: { showToast: async () => undefined } } } as never,
+        {
+          autos: [
+            {
+              name: "Auto Gemini",
+              preferredModels: ["gemini-3.1-pro", "gemini-3.5-flash"],
+              reasoning: ["gemini-3.1-pro"],
+              noReasoning: ["gemini-3.5-flash"],
+            },
+          ],
+        },
+      )
+      const resolved = await hooks.provider!.models!(
+        {
+          id: "github-copilot",
+          models: {
+            "claude-sonnet-4.6": sonnet,
+            "gpt-5.3-codex": codex,
+            "gemini-3.1-pro": geminiPro,
+            "gemini-3.5-flash": geminiFlash,
+          },
+        } as never,
+        oauth,
+      )
+
+      const runTurn = async () => {
+        await hooks["chat.message"]!(
+          { sessionID: "ses_gemini_sticky" } as never,
+          { parts: [{ type: "text", text: "test prompt" }] } as never,
+        )
+        const context = {
+          sessionID: "ses_gemini_sticky",
+          agent: "build",
+          model: resolved["auto-gemini"],
+          provider: { source: "config" as const, info: {} as never, options: {} },
+          message: {} as never,
+        }
+        const paramsOutput = makeOutput()
+        await hooks["chat.params"]!(context, paramsOutput)
+        const headersOutput = makeOutput()
+        await hooks["chat.headers"]!(context, headersOutput)
+        return { paramsOutput, headersOutput }
+      }
+
+      const turn0 = await runTurn()
+      const turn1 = await runTurn()
+
+      expect(turn0.paramsOutput.options.model).toBe("gemini-3.5-flash")
+      // Sticky: turn 1 must reuse turn 0's model despite the flipped verdict.
+      expect(turn1.paramsOutput.options.model).toBe("gemini-3.5-flash")
+      // The session token stays omitted on the sticky turn too.
+      expect(turn0.headersOutput.headers["Copilot-Session-Token"]).toBeUndefined()
+      expect(turn1.headersOutput.headers["Copilot-Session-Token"]).toBeUndefined()
+      expect(intentCalls).toBe(1)
+    } finally {
+      globalThis.fetch = origFetch
+    }
+  })
+
+  test("dedupes derived ids and names for same-family autos", async () => {
+    const models = await callHook(
+      { "claude-sonnet-4.6": sonnet, "claude-haiku-4.5": haiku },
+      {
+        autos: [
+          { preferredModels: ["claude-sonnet-4.6"] },
+          { preferredModels: ["claude-haiku-4.5"] },
+        ],
+      },
+    )
+    // Both anchor on the Claude family, so ids/names must be disambiguated.
+    expect(models["auto-claude"]).toBeDefined()
+    expect(models["auto-claude-2"]).toBeDefined()
+    expect(models["auto-claude"].name).toBe("Auto Claude")
+    expect(models["auto-claude-2"].name).toBe("Auto Claude 2")
+    // Legacy auto is untouched.
+    expect(models.auto.id).toBe("auto")
+    expect(models.auto.name).toBe("Auto")
+  })
+
+  test("derives a unique id when a configured name collides with the legacy auto", async () => {
+    const models = await callHook(
+      { "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex },
+      { autos: [{ name: "Auto" }] },
+    )
+    expect(models.auto.name).toBe("Auto")
+    expect(models["auto-2"]).toBeDefined()
+    expect(models["auto-2"].name).toBe("Auto 2")
+  })
 })
 
 // Packaging guards for the supported (local-path) install. opencode loads the
