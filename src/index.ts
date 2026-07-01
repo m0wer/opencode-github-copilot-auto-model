@@ -597,37 +597,44 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
       const sessionMissingConfiguredPrefs =
         !!session && auto.preferredApiIDs.length > 0 && !auto.preferredApiIDs.some((id) => session.availableModels.includes(id))
       if (sessionMissingConfiguredPrefs && auto.catalogDefaultModelID) {
-        let decision: RouterDecision | undefined
-        if (session.sessionToken && prompt && autoBearer && auto.templateApi && session.availableModels.length) {
-          const context = {
-            session_id: incoming.sessionID,
-            turn_number: conv.turn + 1,
-            previous_model: conv.previousModel,
-            reference_count: conv.referenceCount,
-            prompt_char_count: prompt.length,
-          }
-          decision = await getRouterDecision(
-            capiBase(auto.templateApi.url),
-            autoBearer,
-            session.sessionToken,
-            prompt,
-            session.availableModels,
-            context,
-          )
-        }
-        const routedLabel = decision?.predicted_label ?? configuredLabelForModel(auto, auto.catalogDefaultModelID)
-        decided = configuredModelForLabel(auto, routedLabel) ?? auto.catalogDefaultModelID
         conv.omitSessionToken = true
-        if (decided !== conv.routedModelID || routedLabel !== conv.routedLabel) {
-          toast(
-            `${auto.name} → ${decided}${routedLabel ? ` · ${routedLabel}` : " · configured"}`,
-            routedLabel === "needs_reasoning" ? "success" : "info",
-          )
+        if (conv.routedModelID !== undefined && !conv.needsReEval) {
+          // Sticky: reuse the first turn's pick so the model — and its prompt KV cache —
+          // stays stable across turns, matching the main routing path and VS Code (which
+          // skips routing once turnCount > 0). Re-evaluated only after compaction.
+          decided = conv.routedModelID
+        } else {
+          let decision: RouterDecision | undefined
+          if (session.sessionToken && prompt && autoBearer && auto.templateApi && session.availableModels.length) {
+            const context = {
+              session_id: incoming.sessionID,
+              turn_number: conv.turn + 1,
+              previous_model: conv.previousModel,
+              reference_count: conv.referenceCount,
+              prompt_char_count: prompt.length,
+            }
+            decision = await getRouterDecision(
+              capiBase(auto.templateApi.url),
+              autoBearer,
+              session.sessionToken,
+              prompt,
+              session.availableModels,
+              context,
+            )
+          }
+          const routedLabel = decision?.predicted_label ?? configuredLabelForModel(auto, auto.catalogDefaultModelID)
+          decided = configuredModelForLabel(auto, routedLabel) ?? auto.catalogDefaultModelID
+          if (decided !== conv.routedModelID || routedLabel !== conv.routedLabel) {
+            toast(
+              `${auto.name} → ${decided}${routedLabel ? ` · ${routedLabel}` : " · configured"}`,
+              routedLabel === "needs_reasoning" ? "success" : "info",
+            )
+          }
+          conv.routedModelID = decided
+          conv.routedLabel = routedLabel
+          conv.needsReEval = false
+          log(`session pool lacks configured models for ${auto.id}; using ${decided} without Copilot-Session-Token`)
         }
-        conv.routedModelID = decided
-        conv.routedLabel = routedLabel
-        conv.needsReEval = false
-        log(`session pool lacks configured models for ${auto.id}; using ${decided} without Copilot-Session-Token`)
       } else {
         conv.omitSessionToken = false
       }
