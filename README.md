@@ -69,7 +69,7 @@ always runs regardless):
           {
             // Limited/best-effort: see "Gemini and other non-session models".
             "name": "Auto Gemini",
-            "preferredModels": ["gemini-3.1-pro", "gemini-3.5-flash"]
+            "preferredModels": ["gemini-3.1-pro-preview", "gemini-3.5-flash"]
           }
         ]
       }
@@ -128,9 +128,11 @@ Backing endpoints are reused exactly as opencode resolves them:
 
 - Claude models → `@ai-sdk/anthropic` + `https://api.githubcopilot.com/v1/messages`
 - GPT models → `@ai-sdk/github-copilot` + `https://api.githubcopilot.com/chat/completions`
-- Gemini models → `@ai-sdk/google` + Google's OpenAI-compatible endpoint, when
-  exposed by opencode/Copilot. These are not always included in Copilot's auto
-  session pool.
+- Gemini models → in current opencode catalogs these resolve through the same Copilot
+  transport as GPT (`@ai-sdk/github-copilot` + `https://api.githubcopilot.com`), so the
+  plugin treats them as the GPT endpoint family (some builds may instead expose them via
+  `@ai-sdk/google`). Either way, Gemini is not always included in Copilot's auto session
+  pool, which is the real limitation (see below), not the SDK.
 
 ### Gemini and other non-session models
 
@@ -216,7 +218,7 @@ Use `autos` to inject additional picker models from the same plugin instance:
           {
             // Limited/best-effort: see "Gemini and other non-session models".
             "name": "Auto Gemini",
-            "preferredModels": ["gemini-3.1-pro", "gemini-3.5-flash"]
+            "preferredModels": ["gemini-3.1-pro-preview", "gemini-3.5-flash"]
           }
         ]
       }
