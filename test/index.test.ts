@@ -48,6 +48,13 @@ const gpt54 = makeModel(
   "https://api.githubcopilot.com",
   "GPT-5.4",
 )
+const luna = makeModel(
+  "gpt-5.6-luna",
+  "gpt-5.6-luna",
+  "@ai-sdk/github-copilot",
+  "https://api.githubcopilot.com",
+  "GPT-5.6 Luna",
+)
 const haiku = makeModel(
   "claude-haiku-4.5",
   "claude-haiku-4-5-20251001",
@@ -692,6 +699,16 @@ describe("opencode-github-copilot-auto-model", () => {
     expect(models["auto-claude"].api.npm).toBe("@ai-sdk/anthropic")
     expect(models["auto-gpt"].name).toBe("Auto GPT")
     expect(models["auto-gpt"].api.npm).toBe("@ai-sdk/github-copilot")
+  })
+
+  test("default gpt auto anchors on gpt-5.6-luna when present", async () => {
+    const models = await callHook({
+      "claude-sonnet-4.6": sonnet,
+      "claude-haiku-4.5": haiku,
+      "gpt-5.6-luna": luna,
+      "gpt-5.3-codex": codex,
+    })
+    expect(models["auto-gpt"].api.id).toBe("gpt-5.6-luna")
   })
 
   test("autos: [] disables the default family autos", async () => {

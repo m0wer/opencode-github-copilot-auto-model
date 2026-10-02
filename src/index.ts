@@ -164,6 +164,9 @@ function resolvePreferredApiIDs(models: Record<string, Model>, preferred: string
 // others stay opt-in because their best-effort path needs configured preferences.
 const DEFAULT_AUTO_FAMILIES = ["Claude", "GPT"]
 
+// GPT-5.6 Luna anchors the default Auto GPT route.
+const LUNA_GPT_DEFAULTS = ["gpt-5.6-luna", "gpt-5.6-luna-utility", "gpt-6-luna"]
+
 // One default auto per supported family that has at least two catalog models
 // (the within-family router needs a strong + fast tier to choose between).
 function defaultFamilyDrafts(models: Record<string, Model>): AutoDraft[] {
@@ -178,9 +181,9 @@ function defaultFamilyDrafts(models: Record<string, Model>): AutoDraft[] {
   for (const [index, label] of DEFAULT_AUTO_FAMILIES.entries()) {
     if ((counts.get(label) ?? 0) < 2) continue
     drafts.push({
-      preferredModels: [],
-      reasoning: [],
-      noReasoning: [],
+      preferredModels: label === "GPT" ? [...LUNA_GPT_DEFAULTS] : [],
+      reasoning: label === "GPT" ? ["gpt-5.6-luna", "gpt-6-luna"] : [],
+      noReasoning: label === "GPT" ? ["gpt-5.6-luna", "gpt-5.4-mini"] : [],
       legacy: false,
       index: index + 1,
       familyFilter: label,
