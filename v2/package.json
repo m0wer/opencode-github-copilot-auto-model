@@ -1,0 +1,11 @@
+{
+  "name": "copilot-auto-luna-v2",
+  "version": "1.0.0",
+  "description": "V2 port of opencode-github-copilot-auto-model with GPT-5.6 Luna as AutoGPT route",
+  "type": "module",
+  "main": "index.js",
+  "private": true,
+  "dependencies": {
+    "@opencode/plugin": "2.0.22"
+  }
+}
