@@ -4,6 +4,7 @@ import { homedir } from "node:os"
 import path from "node:path"
 import type { Plugin } from "@opencode-ai/plugin"
 import type { Model } from "@opencode-ai/sdk/v2"
+import type { Plugin as V2Plugin } from "@opencode/plugin/promise/plugin"
 
 const MODEL_ID = "auto"
 const PROVIDER_ID = "github-copilot"
@@ -884,4 +885,211 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
   }
 }
 
-export default { server: CopilotAutoModelPlugin, id: "opencode-github-copilot-auto-model" }
+const CopilotAutoModelV2Plugin: V2Plugin = {
+  id: "opencode-github-copilot-auto-model",
+  async setup(ctx) {
+    const opts = ctx.options as Options
+    const conversations = new Map<string, Map<string, ConvState>>()
+    const injected = new Map<string, InjectedAuto>()
+    const sourceModels = new Map<string, Record<string, unknown>>()
+
+    function getConv(sessionID: string, autoID: string): ConvState {
+      let sessionAutos = conversations.get(sessionID)
+      if (!sessionAutos) {
+        sessionAutos = new Map<string, ConvState>()
+        conversations.set(sessionID, sessionAutos)
+      }
+      let conv = sessionAutos.get(autoID)
+      if (!conv) {
+        conv = { turn: 0 }
+        sessionAutos.set(autoID, conv)
+      }
+      return conv
+    }
+
+    function textFrom(value: unknown): string {
+      if (typeof value === "string") return value
+      if (Array.isArray(value)) return value.map(textFrom).filter(Boolean).join("\n")
+      if (!value || typeof value !== "object") return ""
+      const record = value as Record<string, unknown>
+      if (record.type === "text" && typeof record.text === "string") return record.text
+      if (typeof record.text === "string") return record.text
+      return textFrom(record.content ?? record.parts)
+    }
+
+    await ctx.provider.transform((editor) => {
+      const provider = editor.get(PROVIDER_ID)
+      if (!provider) return
+      const catalog = [...provider.models.values()] as Array<Record<string, unknown>>
+      const projected = Object.fromEntries(
+        catalog.map((model) => {
+          const modelID = String(model.modelID ?? model.id)
+          const modelName = String(model.name ?? model.id)
+          const isClaude = modelName.toLowerCase().includes("claude")
+          const projectedModel = {
+            ...model,
+            id: String(model.id),
+            providerID: PROVIDER_ID,
+            name: modelName,
+            family: model.family,
+            api: {
+              id: modelID,
+              npm: isClaude ? "@ai-sdk/anthropic" : "@ai-sdk/github-copilot",
+              url: isClaude ? "https://api.githubcopilot.com/v1" : "https://api.githubcopilot.com",
+            },
+          }
+          return [String(model.id), projectedModel as unknown as Model]
+        }),
+      )
+      autoKnownModels = Object.values(projected)
+      sourceModels.clear()
+      for (const [id, model] of Object.entries(projected)) {
+        sourceModels.set(id, catalog.find((item) => item.id === id)!)
+      }
+
+      const drafts = autoDrafts(opts, projected)
+      const usedIDs = new Set<string>([...Object.keys(projected), MODEL_ID])
+      const usedNames = new Set<string>(["Auto"])
+      const autoModels: Array<Record<string, unknown>> = []
+      injected.clear()
+      for (const draft of drafts) {
+        const preferredApiIDs = resolvePreferredApiIDs(projected, draft.preferredModels)
+        const reasoningApiIDs = resolvePreferredApiIDs(projected, draft.reasoning)
+        const noReasoningApiIDs = resolvePreferredApiIDs(projected, draft.noReasoning)
+        const template = preferredApiIDs.map(modelByApiId).find((model): model is Model => !!model)
+          ?? pickTemplate(projected, draft.familyFilter)
+        if (!template || (draft.requestedID && projected[draft.requestedID])) continue
+        const name = draft.legacy ? "Auto" : uniqueValue(draft.requestedName || defaultAutoName(draft, template), usedNames, " ")
+        const id = draft.legacy ? MODEL_ID : uniqueValue(draft.requestedID || defaultAutoID(draft, template), usedIDs)
+        const auto: InjectedAuto = {
+          id,
+          name,
+          preferredModels: draft.preferredModels,
+          reasoning: draft.reasoning,
+          noReasoning: draft.noReasoning,
+          preferredApiIDs,
+          reasoningApiIDs,
+          noReasoningApiIDs,
+          template,
+          templateApi: templateAPI(template),
+          catalogDefaultModelID: template.api.id,
+          familyFilter: draft.familyFilter,
+        }
+        injected.set(id, auto)
+        const source = sourceModels.get(template.id)
+        if (source) {
+          autoModels.push({
+            ...source,
+            id,
+            modelID: template.api.id,
+            name,
+            family: "github-copilot-auto",
+            variants: [],
+          })
+        }
+      }
+      editor.models.set(PROVIDER_ID, [...catalog, ...autoModels] as never)
+    })
+
+    await ctx.session.hook("context", (event) => {
+      if (event.model.providerID !== PROVIDER_ID || !injected.has(event.model.id)) return
+      const lastUserMessage = [...event.messages].reverse().find((message) => message.role === "user")
+      if (!lastUserMessage) return
+      const auto = injected.get(event.model.id)!
+      const conv = getConv(event.sessionID, auto.id)
+      conv.lastPrompt = textFrom(lastUserMessage.content)
+      conv.referenceCount = Array.isArray(lastUserMessage.content)
+        ? lastUserMessage.content.filter(
+            (part) => typeof part === "object" && part !== null && "type" in part && (part as { type: string }).type === "file",
+          ).length
+        : 0
+    })
+
+    await ctx.session.hook("compaction", (event) => {
+      for (const conv of conversations.get(event.sessionID)?.values() ?? []) conv.needsReEval = true
+    })
+
+    await ctx.session.hook("http.request", async (event) => {
+      if (event.kind !== "primary" || event.model.providerID !== PROVIDER_ID) return
+      const auto = injected.get(event.model.id)
+      if (!auto) return
+      const request = event.request
+      const bearer = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "")
+      if (!bearer) return
+      const baseURL = capiBase(new URL(request.url).origin)
+      const conv = getConv(event.sessionID, auto.id)
+      if (!conv.session || Date.now() >= conv.session.expiresAtMs - SESSION_REFRESH_SKEW_MS) {
+        if (!conv.sessionInflight) {
+          conv.sessionInflight = fetchAutoSession(baseURL, bearer)
+            .then((session) => {
+              if (session) conv.session = session
+              return conv.session
+            })
+            .finally(() => {
+              conv.sessionInflight = undefined
+            })
+        }
+        await conv.sessionInflight
+      }
+      const session = conv.session
+      const pool = (session?.availableModels ?? []).filter(
+        (id) => !auto.familyFilter || familyLabel(modelByApiId(id)) === auto.familyFilter,
+      )
+      let decided =
+        preferredPoolModel(pool, auto.preferredApiIDs, auto.templateApi) ??
+        defaultPoolModel(pool, auto.templateApi) ??
+        (session?.selectedModelID && isSameFamily(session.selectedModelID, auto.templateApi) ? session.selectedModelID : undefined) ??
+        auto.catalogDefaultModelID ??
+        auto.templateApi?.id
+
+      if (conv.routedModelID !== undefined && !conv.needsReEval) {
+        decided = conv.routedModelID
+      } else if (session?.sessionToken && conv.lastPrompt && session.availableModels.length) {
+        const decision = await getRouterDecision(baseURL, bearer, session.sessionToken, conv.lastPrompt, session.availableModels, {
+          session_id: event.sessionID,
+          turn_number: conv.turn + 1,
+          previous_model: conv.previousModel,
+          reference_count: conv.referenceCount,
+          prompt_char_count: conv.lastPrompt.length,
+        })
+        const candidates = (decision?.candidate_models ?? []).filter(
+          (candidate) => !auto.familyFilter || familyLabel(modelByApiId(candidate)) === auto.familyFilter,
+        )
+        const labelPrefs = decision?.predicted_label === "needs_reasoning" ? auto.reasoningApiIDs
+          : decision?.predicted_label === "no_reasoning" ? auto.noReasoningApiIDs
+          : auto.preferredApiIDs
+        decided = pickSameFamilyCandidate(candidates, labelPrefs.length ? labelPrefs : auto.preferredApiIDs, auto.templateApi) ?? decided
+        conv.routedLabel = decision?.predicted_label
+        conv.needsReEval = false
+      }
+      conv.routedModelID = decided
+      conv.previousModel = decided
+      conv.turn += 1
+      if (!decided) return
+
+      let body: Record<string, unknown> | undefined
+      try {
+        const parsed: unknown = await request.clone().json()
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) body = parsed as Record<string, unknown>
+      } catch {
+        return
+      }
+      if (!body) return
+      body.model = decided
+      const effort = reasoningOptions(decided, conv.routedLabel)
+      if (effort) {
+        if ("reasoningEffort" in effort) body.reasoning_effort = effort.reasoningEffort
+        if ("reasoningSummary" in effort) body.reasoning_summary = effort.reasoningSummary
+        if ("include" in effort) body.include = effort.include
+        if ("thinking" in effort) body.thinking = effort.thinking
+      }
+      const headers = new Headers(request.headers)
+      if (session?.sessionToken && pool.includes(decided)) headers.set("Copilot-Session-Token", session.sessionToken)
+      else headers.delete("Copilot-Session-Token")
+      event.request = new Request(request, { headers, body: JSON.stringify(body) })
+      log(`v2 request routed ${auto.id} -> ${decided}`)
+    })
+  },
+}
+
+export default { ...CopilotAutoModelV2Plugin, server: CopilotAutoModelPlugin }

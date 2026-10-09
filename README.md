@@ -19,7 +19,7 @@ per-family autos (or any configured autos, which replace the defaults).
 
 ## Install
 
-Add the package name to `~/.config/opencode/opencode.json`:
+For OpenCode 1.x and 2.0.20, add the package name to `~/.config/opencode/opencode.json`:
 
 ```jsonc
 {
@@ -29,7 +29,30 @@ Add the package name to `~/.config/opencode/opencode.json`:
 }
 ```
 
+Newer OpenCode 2.x releases use the plural `plugins` key, for example in
+`~/.config/opencode/opencode.jsonc`:
+
+```jsonc
+{
+  "plugins": ["opencode-github-copilot-auto-model"]
+}
+```
+
 opencode will install it automatically from npm on first run.
+
+For a local checkout on OpenCode 2.0.20, build the package and add a project
+plugin entry at `.opencode/plugins/copilot-auto-model.ts`:
+
+```ts
+export { default } from "../../opencode-github-copilot-auto-model/dist/index.js"
+```
+
+OpenCode discovers that file automatically; no `opencode.json` plugin entry is
+needed. The relative import above assumes the plugin checkout is a directory at
+the workspace root.
+
+The package supports both plugin APIs. OpenCode 2.x routes Auto requests through
+its session hooks.
 
 > **Why not `github:m0wer/...`?** opencode installs `github:` plugins by having
 > npm's arborist git-clone the repo on startup. That clone takes ~4s, but
