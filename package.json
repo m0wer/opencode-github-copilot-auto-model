@@ -23,6 +23,7 @@
     "release": "npm login --auth-type=web && npm publish"
   },
   "devDependencies": {
+    "@opencode/plugin": "2.0.20",
     "@opencode-ai/plugin": "*",
     "@opencode-ai/sdk": "*",
     "@types/bun": "latest",

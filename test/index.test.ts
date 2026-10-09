@@ -170,6 +170,93 @@ async function callChatParamsWithRouting(
 }
 
 describe("opencode-github-copilot-auto-model", () => {
+  test("exports the v1 server and v2 setup plugin definition", () => {
+    expect(plugin.id).toBe("opencode-github-copilot-auto-model")
+    expect(typeof plugin.server).toBe("function")
+    expect(typeof plugin.setup).toBe("function")
+  })
+
+  test("v2 setup injects Auto models and routes requests through Copilot auto", async () => {
+    const hooks: Record<string, (event: never) => Promise<void> | void> = {}
+    let injectedModels: unknown[] = []
+    const v2Models = [sonnet, codex, gpt54].map((model) => ({
+      id: model.id,
+      modelID: model.api.id,
+      providerID: model.providerID,
+      name: model.name,
+      family: model.family,
+      status: "active",
+      enabled: true,
+      capabilities: { tools: true, input: ["text"], output: ["text"] },
+      variants: [],
+      time: { released: 1 },
+      cost: [],
+      limit: { context: 200000, output: 8192 },
+    }))
+    const context = {
+      options: { preferredModels: ["gpt-5.4"], noReasoning: ["gpt-5.4"] },
+      provider: {
+        transform: async (callback: (editor: never) => void) =>
+          callback({
+            get: () => ({ models: new Map(v2Models.map((model) => [model.id, model])) }),
+            models: { set: (_providerID: string, models: unknown[]) => (injectedModels = models) },
+          } as never),
+      },
+      session: {
+        hook: async (name: string, callback: (event: never) => Promise<void> | void) => {
+          hooks[name] = callback
+        },
+      },
+    }
+
+    await plugin.setup!(context as never)
+    expect(injectedModels.some((model) => (model as { id: string }).id === "auto")).toBe(true)
+
+    const sessionEvent = {
+      sessionID: "ses_v2",
+      model: { providerID: "github-copilot", id: "auto" },
+      messages: [{ role: "user", content: [{ type: "text", text: "quick task" }] }],
+      system: [],
+      tools: {},
+      options: {},
+    }
+    await hooks.context(sessionEvent as never)
+
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      if (url.toString().includes("/models/session/intent")) {
+        return new Response(JSON.stringify({
+          predicted_label: "no_reasoning",
+          candidate_models: ["gpt-5.3-codex", "gpt-5.4"],
+          confidence: 0.99,
+        }), { status: 200 })
+      }
+      return new Response(JSON.stringify({
+        session_token: "v2-session-token",
+        selected_model: "gpt-5.3-codex",
+        available_models: ["gpt-5.3-codex", "gpt-5.4"],
+        expires_at: Math.floor(Date.now() / 1000) + 3600,
+      }), { status: 200 })
+    }) as typeof fetch
+
+    try {
+      const requestEvent = {
+        ...sessionEvent,
+        kind: "primary",
+        request: new Request("https://api.githubcopilot.com/chat/completions", {
+          method: "POST",
+          headers: { authorization: "Bearer test-token", "content-type": "application/json" },
+          body: JSON.stringify({ model: "auto", messages: [] }),
+        }),
+      }
+      await hooks["http.request"](requestEvent as never)
+      expect(await requestEvent.request.json()).toMatchObject({ model: "gpt-5.4" })
+      expect(requestEvent.request.headers.get("Copilot-Session-Token")).toBe("v2-session-token")
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   test("uses first available copilot model when no auto session is available", async () => {
     const models = await callHook({ "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex })
     expect(models.auto).toBeDefined()
