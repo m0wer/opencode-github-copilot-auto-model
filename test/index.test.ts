@@ -4,859 +4,487 @@ import { describe, expect, test } from "bun:test"
 import pkg from "../package.json"
 import plugin from "../src/index"
 
-const makeModel = (id: string, apiId: string, npm: string, url: string, name: string) => ({
+const COPILOT = "https://api.githubcopilot.com"
+const COPILOT_SDK = "aisdk:@ai-sdk/github-copilot"
+const ANTHROPIC = "@opencode/ai/providers/anthropic"
+
+type Wire = "responses" | "chat" | "messages"
+type FakeModel = {
+  id: string
+  modelID: string
+  providerID: string
+  name: string
+  family: string
+  package: string
+  settings: Record<string, unknown>
+  enabled: boolean
+  variants: unknown[]
+}
+
+// Shaped like opencode 2's Copilot catalog (CopilotModels.derive).
+const makeModel = (id: string, name: string, family: string, wire: Wire): FakeModel => ({
   id,
+  modelID: id,
   providerID: "github-copilot",
-  api: { id: apiId, url, npm },
   name,
-  family: "gpt",
-  status: "active",
-  headers: {},
-  options: {},
-  cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-  limit: { context: 200000, output: 8192 },
-  capabilities: {
-    temperature: true,
-    reasoning: false,
-    attachment: true,
-    toolcall: true,
-    input: { text: true, audio: false, image: false, video: false, pdf: false },
-    output: { text: true, audio: false, image: false, video: false, pdf: false },
-    interleaved: false,
-  },
-  release_date: "2026-01-01",
+  family,
+  package: wire === "messages" ? ANTHROPIC : COPILOT_SDK,
+  settings: { baseURL: wire === "messages" ? `${COPILOT}/v1` : COPILOT, endpoint: wire },
+  enabled: true,
+  variants: [{ id: "high", settings: { reasoningEffort: "high" } }],
 })
 
-const sonnet = makeModel(
-  "claude-sonnet-4.6",
-  "claude-sonnet-4-6-20250929",
-  "@ai-sdk/anthropic",
-  "https://api.githubcopilot.com/v1",
-  "Claude Sonnet 4.6",
-)
-const codex = makeModel(
-  "gpt-5.3-codex",
-  "gpt-5.3-codex",
-  "@ai-sdk/github-copilot",
-  "https://api.githubcopilot.com",
-  "GPT-5.3 Codex",
-)
-const gpt54 = makeModel(
-  "gpt-5.4",
-  "gpt-5.4",
-  "@ai-sdk/github-copilot",
-  "https://api.githubcopilot.com",
-  "GPT-5.4",
-)
-const haiku = makeModel(
-  "claude-haiku-4.5",
-  "claude-haiku-4-5-20251001",
-  "@ai-sdk/anthropic",
-  "https://api.githubcopilot.com/v1",
-  "Claude Haiku 4.5",
-)
-const geminiPro = makeModel(
-  "gemini-3.1-pro",
-  "gemini-3.1-pro",
-  "@ai-sdk/google",
-  "https://generativelanguage.googleapis.com/v1beta/openai",
-  "Gemini 3.1 Pro",
-)
-const geminiFlash = makeModel(
-  "gemini-3.5-flash",
-  "gemini-3.5-flash",
-  "@ai-sdk/google",
-  "https://generativelanguage.googleapis.com/v1beta/openai",
-  "Gemini 3.5 Flash",
-)
+const sonnet = makeModel("claude-sonnet-5.5", "Claude Sonnet 5.5", "claude-sonnet-5.5", "messages")
+const haiku = makeModel("claude-haiku-5.5", "Claude Haiku 5.5", "claude-haiku-5.5", "messages")
+const gpt54 = makeModel("gpt-5.4", "GPT-5.4", "gpt-5.4", "responses")
+const luna = makeModel("gpt-6-luna", "GPT-6 Luna", "gpt-6-luna", "responses")
+const sol = makeModel("gpt-6.1-sol", "GPT-6.1 Sol", "gpt-6.1-sol", "responses")
+const mai = makeModel("mai-code-1.1-flash", "MAI Code 1.1 Flash", "mai-code", "responses")
+const gemini = makeModel("gemini-3.1-pro", "Gemini 3.1 Pro", "gemini-3.1-pro", "chat")
+const geminiFlash = makeModel("gemini-3.5-flash", "Gemini 3.5 Flash", "gemini-3.5-flash", "chat")
 
-const oauth = {
-  auth: { type: "oauth", refresh: "test-bearer", access: "test-access", expires: Date.now() + 3600_000 } as never,
-}
+const catalog = [sonnet, haiku, gpt54, luna, sol]
 
-async function callHook(models: Record<string, unknown>, options?: Record<string, unknown>) {
-  const hooks = await plugin.server({} as never, options ?? {})
-  return hooks.provider!.models!({ id: "github-copilot", models } as never, {})
-}
+type Handler = (body: Record<string, unknown>) => unknown
+type Call = { kind?: "auto" | "legacy"; body: Record<string, unknown>; headers: Record<string, string> }
 
-function makeOutput() {
-  return {
-    temperature: 0,
-    topP: 0,
-    topK: 0,
-    maxOutputTokens: undefined as number | undefined,
-    options: {} as Record<string, unknown>,
-    headers: {} as Record<string, string>,
-  }
-}
-
-async function callChatParams(models: Record<string, unknown>, options?: Record<string, unknown>, autoID = "auto") {
-  const hooks = await plugin.server({} as never, options ?? {})
-  const resolved = await hooks.provider!.models!({ id: "github-copilot", models } as never, {})
-  const output = makeOutput()
-  await hooks["chat.params"]!(
-    {
-      sessionID: "ses_test",
-      agent: "build",
-      model: resolved[autoID],
-      provider: { source: "config", info: {} as never, options: {} },
-      message: {} as never,
-    },
-    output,
-  )
-  return output
-}
-
-// Simulates a full session+intent routing cycle with mocked fetch, used to test
-// per-label preference and label-suffix behavior.
-async function callChatParamsWithRouting(
-  models: Record<string, unknown>,
-  options: Record<string, unknown>,
-  sessionID: string,
-  intentResponse: {
-    predicted_label: "needs_reasoning" | "no_reasoning"
-    candidate_models: string[]
-    confidence: number
-  },
-  autoID = "auto",
-) {
+// Replaces fetch for the duration of `fn`. A handler returning a number answers
+// with that HTTP status; anything else is sent as a 200 JSON body.
+async function withFetch<T>(handlers: { auto?: Handler; legacy?: Handler }, fn: (calls: Call[]) => Promise<T>) {
   const origFetch = globalThis.fetch
-  const availableModels = Object.values(models)
-    .filter((m) => (m as { providerID: string }).providerID === "github-copilot")
-    .map((m) => (m as { api: { id: string } }).api.id)
-  const mockSession = {
-    session_token: "test-session-token",
-    selected_model: availableModels[0],
-    available_models: availableModels,
-    expires_at: Math.floor(Date.now() / 1000) + 3600,
-  }
-  const mockFetch = async (url: string | URL | Request, _init?: RequestInit): Promise<Response> => {
+  const calls: Call[] = []
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
     const u = url.toString()
-    if (u.includes("/models/session/intent"))
-      return new Response(JSON.stringify(intentResponse), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      })
-    if (u.includes("/models/session"))
-      return new Response(JSON.stringify(mockSession), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      })
-    return origFetch(url, _init)
-  }
-  globalThis.fetch = mockFetch as unknown as typeof fetch
+    const kind = u.endsWith("/auto") ? "auto" : u.endsWith("/models/session") ? "legacy" : undefined
+    const body = init?.body ? JSON.parse(init.body as string) : {}
+    calls.push({ kind, body, headers: (init?.headers ?? {}) as Record<string, string> })
+    const handler = kind && handlers[kind]
+    if (!handler) return new Response("not found", { status: 404 })
+    const reply = handler(body)
+    if (typeof reply === "number") return new Response("error", { status: reply })
+    return Response.json(reply)
+  }) as typeof fetch
   try {
-    const hooks = await plugin.server({} as never, options)
-    const resolved = await hooks.provider!.models!({ id: "github-copilot", models } as never, oauth)
-    await hooks["chat.message"]!(
-      { sessionID } as never,
-      { parts: [{ type: "text", text: "test prompt" }] } as never,
-    )
-    const output = makeOutput()
-    await hooks["chat.params"]!(
-      {
-        sessionID,
-        agent: "build",
-        model: resolved[autoID],
-        provider: { source: "config", info: {} as never, options: {} },
-        message: {} as never,
-      },
-      output,
-    )
-    return { output, resolved }
+    return await fn(calls)
   } finally {
     globalThis.fetch = origFetch
   }
 }
 
-describe("opencode-github-copilot-auto-model", () => {
-  test("uses first available copilot model when no auto session is available", async () => {
-    const models = await callHook({ "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex })
-    expect(models.auto).toBeDefined()
-    expect(models.auto.id).toBe("auto")
-    expect(models.auto.api.id).toBe("claude-sonnet-4-6-20250929")
-    expect(models.auto.api.npm).toBe("@ai-sdk/anthropic")
-    expect(models.auto.name).toBe("Auto")
-  })
+const autoPicks = (id: string, ttlSeconds = 86_400) => () => ({
+  session_token: `tok-${id}`,
+  expires_at: Math.floor(Date.now() / 1000) + ttlSeconds,
+  selected_model: { id },
+})
 
-  test("overrides request body model for auto in chat.params", async () => {
-    const output = await callChatParams({ "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex })
-    expect(output.options.model).toBe("claude-sonnet-4-6-20250929")
-  })
+const oauth = { type: "oauth", refresh: "test-bearer", access: "", expires: 0, metadata: {} }
 
-  test("falls back to another available copilot model", async () => {
-    const models = await callHook({ "claude-sonnet-4.6": sonnet, "claude-haiku-4.5": haiku })
-    expect(models.auto.id).toBe("auto")
-    expect(models.auto.api.id).toBe("claude-sonnet-4-6-20250929")
-    expect(models.auto.api.npm).toBe("@ai-sdk/anthropic")
-    expect(models.auto.name).toBe("Auto")
-  })
+type Hook = (event: any) => Promise<void> | void
 
-  test("falls back to claude-haiku-4.5 as last resort", async () => {
-    const models = await callHook({ "claude-haiku-4.5": haiku })
-    expect(models.auto.id).toBe("auto")
-    expect(models.auto.api.id).toBe("claude-haiku-4-5-20251001")
-    expect(models.auto.name).toBe("Auto")
-  })
-
-  test("preserves /v1 in url for Claude models (Anthropic SDK appends /messages, not /v1/messages)", async () => {
-    const models = await callHook({ "claude-sonnet-4.6": sonnet })
-    expect(models.auto.api.url).toBe("https://api.githubcopilot.com/v1")
-  })
-
-  test("no-ops when auto already present", async () => {
-    const existing = makeModel("auto", "auto", "@ai-sdk/github-copilot", "https://api.githubcopilot.com", "Auto")
-    const models = await callHook({ auto: existing, "gpt-5.3-codex": codex })
-    expect(models.auto.api.id).toBe("auto")
-  })
-
-  test("injects auto from any available copilot model", async () => {
-    const other = makeModel("gpt-5.5", "gpt-5.5", "@ai-sdk/github-copilot", "https://api.githubcopilot.com", "GPT-5.5")
-    const models = await callHook({ "gpt-5.5": other })
-    expect(models.auto).toBeDefined()
-    expect(models.auto.api.id).toBe("gpt-5.5")
-  })
-
-  test("supports preferredModels by model key", async () => {
-    const models = await callHook(
-      { "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex },
-      { preferredModels: ["gpt-5.3-codex"] },
-    )
-    expect(models.auto.api.id).toBe("gpt-5.3-codex")
-  })
-
-  test("supports preferredModels ordered list", async () => {
-    const models = await callHook(
-      { "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex },
-      { preferredModels: ["missing", "gpt-5.3-codex", "claude-sonnet-4.6"] },
-    )
-    expect(models.auto.api.id).toBe("gpt-5.3-codex")
-  })
-
-  test("chat.params uses preferred fallback model when sessions are unavailable", async () => {
-    const output = await callChatParams(
-      { "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex },
-      { preferredModels: ["gpt-5.3-codex"] },
-    )
-    expect(output.options.model).toBe("gpt-5.3-codex")
-  })
-
-  test("injects configured autos with derived ids and names", async () => {
-    const models = await callHook(
-      { "claude-sonnet-4.6": sonnet, "claude-haiku-4.5": haiku, "gpt-5.3-codex": codex },
-      {
-        autos: [
-          { preferredModels: ["claude-sonnet-4.6", "claude-haiku-4.5"] },
-          { name: "Auto GPT/Codex", preferredModels: ["gpt-5.3-codex"] },
-        ],
+// Loads the plugin against a minimal stand-in for opencode 2's plugin context: a
+// model editor over `models` and a recorder for session hooks.
+async function setup(models: FakeModel[], options: Record<string, unknown> = {}, credential: unknown = oauth) {
+  const store = new Map(models.map((m) => [m.id, structuredClone(m)]))
+  const hooks = new Map<string, { callback: Hook; providerID?: string }>()
+  const transforms: Array<(editor: unknown) => void> = []
+  const registration = { dispose: async () => {} }
+  const ctx = {
+    options,
+    integration: {
+      connection: {
+        active: async () => (credential ? { integrationID: "github-copilot" } : undefined),
+        resolve: async () => credential,
       },
-    )
-    expect(models.auto.name).toBe("Auto")
-    expect(models["auto-claude"].name).toBe("Auto Claude")
-    expect(models["auto-gpt-codex"].name).toBe("Auto GPT/Codex")
-  })
-
-  test("derives gemini auto family from configured preferred models", async () => {
-    const models = await callHook(
-      { "gemini-3.1-pro": geminiPro, "gemini-3.5-flash": geminiFlash },
-      { autos: [{ preferredModels: ["gemini-3.1-pro", "gemini-3.5-flash"] }] },
-    )
-    expect(models["auto-gemini"].name).toBe("Auto Gemini")
-    expect(models["auto-gemini"].api.npm).toBe("@ai-sdk/google")
-  })
-
-  test("configured gemini auto keeps its preferred family when session pool omits gemini", async () => {
-    const origFetch = globalThis.fetch
-    globalThis.fetch = (async (url: string | URL | Request, _init?: RequestInit): Promise<Response> => {
-      const u = url.toString()
-      if (u.includes("/models/session"))
-        return new Response(
-          JSON.stringify({
-            session_token: "test-session-token",
-            selected_model: "claude-sonnet-4-6-20250929",
-            available_models: ["claude-sonnet-4-6-20250929", "gpt-5.3-codex"],
-            expires_at: Math.floor(Date.now() / 1000) + 3600,
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        )
-      return origFetch(url, _init)
-    }) as unknown as typeof fetch
-
-    try {
-      const hooks = await plugin.server({} as never, {
-        autos: [{ name: "Auto Gemini", preferredModels: ["gemini-3.1-pro", "gemini-3.5-flash"] }],
-      })
-      const models = await hooks.provider!.models!(
-        {
-          id: "github-copilot",
-          models: {
-            "claude-sonnet-4.6": sonnet,
-            "gpt-5.3-codex": codex,
-            "gemini-3.1-pro": geminiPro,
-            "gemini-3.5-flash": geminiFlash,
-          },
-        } as never,
-        oauth,
-      )
-
-      expect(models["auto-gemini"].api.id).toBe("gemini-3.1-pro")
-      expect(models["auto-gemini"].api.npm).toBe("@ai-sdk/google")
-    } finally {
-      globalThis.fetch = origFetch
+    },
+    model: {
+      transform: async (callback: (editor: unknown) => void) => {
+        transforms.push(callback)
+        runTransforms()
+        return registration
+      },
+    },
+    session: {
+      hook: async (name: string, callback: Hook, opts?: { providerID?: string }) => {
+        hooks.set(name, { callback, providerID: opts?.providerID })
+        return registration
+      },
+    },
+  }
+  // opencode replays transforms over the source catalog whenever it changes.
+  function runTransforms() {
+    const data = new Map(models.map((m) => [m.id, structuredClone(m)]))
+    const editor = {
+      list: () => Array.from(data.values()),
+      get: (_p: string, id: string) => data.get(id),
+      update: (_p: string, id: string, fn: (draft: Record<string, unknown>) => void) => {
+        const draft = (data.get(id) ?? {}) as Record<string, unknown>
+        fn(draft)
+        draft.id = id
+        draft.providerID = "github-copilot"
+        data.set(id, draft as FakeModel)
+      },
+      remove: (_p: string, id: string) => data.delete(id),
     }
-  })
+    for (const transform of transforms) transform(editor)
+    store.clear()
+    for (const [id, model] of data) store.set(id, model)
+  }
+  await plugin.setup(ctx as never)
 
-  test("configured gemini auto omits session token when session pool omits gemini", async () => {
-    const origFetch = globalThis.fetch
-    globalThis.fetch = (async (url: string | URL | Request, _init?: RequestInit): Promise<Response> => {
-      const u = url.toString()
-      if (u.includes("/models/session/intent"))
-        return new Response(
-          JSON.stringify({
-            predicted_label: "no_reasoning",
-            candidate_models: ["gpt-5.3-codex", "claude-sonnet-4-6-20250929"],
-            confidence: 0.93,
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        )
-      if (u.includes("/models/session"))
-        return new Response(
-          JSON.stringify({
-            session_token: "test-session-token",
-            selected_model: "claude-sonnet-4-6-20250929",
-            available_models: ["claude-sonnet-4-6-20250929", "gpt-5.3-codex"],
-            expires_at: Math.floor(Date.now() / 1000) + 3600,
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        )
-      return origFetch(url, _init)
-    }) as unknown as typeof fetch
+  const call = async (name: string, event: Record<string, unknown>) => hooks.get(name)?.callback(event)
 
-    try {
-      const toasts: { body: { message: string; variant: string } }[] = []
-      const hooks = await plugin.server(
-        {
-          client: { tui: { showToast: async (toast: { body: { message: string; variant: string } }) => toasts.push(toast) } },
-        } as never,
-        {
-          autos: [
-            {
-              name: "Auto Gemini",
-              preferredModels: ["gemini-3.1-pro", "gemini-3.5-flash"],
-              reasoning: ["gemini-3.1-pro"],
-              noReasoning: ["gemini-3.5-flash"],
-            },
-          ],
-        },
-      )
-      const models = await hooks.provider!.models!(
-        {
-          id: "github-copilot",
-          models: {
-            "claude-sonnet-4.6": sonnet,
-            "gpt-5.3-codex": codex,
-            "gemini-3.1-pro": geminiPro,
-            "gemini-3.5-flash": geminiFlash,
-          },
-        } as never,
-        oauth,
-      )
-      await hooks["chat.message"]!(
-        { sessionID: "ses_gemini_missing_pool" } as never,
-        { parts: [{ type: "text", text: "test prompt" }] } as never,
-      )
-      const paramsOutput = makeOutput()
-      await hooks["chat.params"]!(
-        {
-          sessionID: "ses_gemini_missing_pool",
-          agent: "build",
-          model: models["auto-gemini"],
-          provider: { source: "config", info: {} as never, options: {} },
-          message: {} as never,
-        },
-        paramsOutput,
-      )
-      const headersOutput = makeOutput()
-      await hooks["chat.headers"]!(
-        {
-          sessionID: "ses_gemini_missing_pool",
-          agent: "build",
-          model: models["auto-gemini"],
-          provider: { source: "config", info: {} as never, options: {} },
-          message: {} as never,
-        },
-        headersOutput,
-      )
-
-      expect(paramsOutput.options.model).toBe("gemini-3.5-flash")
-      expect(headersOutput.headers["Copilot-Session-Token"]).toBeUndefined()
-      expect(toasts).toEqual([
-        { body: { message: "Auto Gemini → gemini-3.5-flash · no_reasoning", variant: "info" } },
-      ])
-    } finally {
-      globalThis.fetch = origFetch
+  // One model call as opencode 2 issues it: prompt admission (when `prompt` is set),
+  // context, model.request, then the native HTTP request built for the model's modelID.
+  async function turn(
+    modelKey: string,
+    { sessionID = "ses_test", prompt = "test prompt" as string | undefined, files = [] as unknown[], kind = "primary" } = {},
+  ) {
+    const model = store.get(modelKey)!
+    const ref = { providerID: "github-copilot", id: modelKey }
+    if (prompt !== undefined) await call("prompt", { sessionID, prompt: { text: prompt, files } })
+    const context = { sessionID, agent: "build", model: ref, system: [], messages: [], tools: {}, options: {} as Record<string, unknown> }
+    if (kind === "primary") await call("context", context)
+    if (kind === "compaction") await call("compaction", context)
+    const modelRequest = { sessionID, agent: "build", model: ref, kind, headers: {} as Record<string, string> }
+    await call("model.request", modelRequest)
+    const request = new Request(`${COPILOT}/responses`, {
+      method: "POST",
+      headers: { ...modelRequest.headers, "content-type": "application/json", "content-length": "999" },
+      body: JSON.stringify({ model: model.modelID, input: [], temperature: 0.7 }),
+    })
+    const http = { sessionID, agent: "build", model: ref, kind, request }
+    await call("http.request", http)
+    const sent = JSON.parse(await http.request.text()) as { model: string; temperature?: number }
+    return {
+      model: sent.model,
+      temperature: sent.temperature,
+      token: modelRequest.headers["Copilot-Session-Token"],
+      options: context.options,
+      contentLength: http.request.headers.get("content-length"),
     }
+  }
+
+  return { store, hooks, turn, call, runTransforms }
+}
+
+describe("catalog injection", () => {
+  test("injects Auto cloned from a GPT Responses anchor", async () => {
+    const { store } = await setup(catalog)
+    const auto = store.get("auto")!
+    expect(auto.name).toBe("Auto")
+    expect(auto.modelID).toBe("gpt-5.4")
+    expect(auto.package).toBe(COPILOT_SDK)
+    expect(auto.settings.endpoint).toBe("responses")
+    expect(auto.family).toBe("gpt-5.4")
+    expect(auto.variants).toEqual([])
   })
 
-  test("noReasoning option picks preferred fast model when intent says no_reasoning", async () => {
-    const { output } = await callChatParamsWithRouting(
-      { "claude-sonnet-4.6": sonnet, "claude-haiku-4.5": haiku },
-      { noReasoning: ["claude-haiku-4.5"] },
-      "ses_no_reasoning_1",
-      {
-        predicted_label: "no_reasoning",
-        candidate_models: ["claude-sonnet-4-6-20250929", "claude-haiku-4-5-20251001"],
-        confidence: 0.95,
-      },
-    )
-    expect(output.options.model).toBe("claude-haiku-4-5-20251001")
+  test("makes no network calls while building the catalog", async () => {
+    await withFetch({ auto: autoPicks("gpt-6-luna") }, async (calls) => {
+      await setup(catalog)
+      expect(calls).toHaveLength(0)
+    })
   })
 
-  test("reasoning option picks preferred strong model when intent says needs_reasoning", async () => {
-    const { output } = await callChatParamsWithRouting(
-      { "claude-sonnet-4.6": sonnet, "claude-haiku-4.5": haiku },
-      { reasoning: ["claude-sonnet-4.6"], noReasoning: ["claude-haiku-4.5"] },
-      "ses_reasoning_1",
-      {
-        predicted_label: "needs_reasoning",
-        candidate_models: ["claude-haiku-4-5-20251001", "claude-sonnet-4-6-20250929"],
-        confidence: 0.91,
-      },
-    )
-    expect(output.options.model).toBe("claude-sonnet-4-6-20250929")
+  test("family autos keep their anchor's endpoint", async () => {
+    const { store } = await setup(catalog)
+    expect(store.get("auto-claude")!.settings.baseURL).toBe(`${COPILOT}/v1`)
+    expect(store.get("auto-claude")!.package).toBe(ANTHROPIC)
+    expect(store.get("auto-gpt")!.modelID).toBe("gpt-5.4")
   })
 
-  test("configured claude auto skips cross-family candidates", async () => {
-    const { output } = await callChatParamsWithRouting(
-      { "claude-sonnet-4.6": sonnet, "claude-haiku-4.5": haiku, "gpt-5.3-codex": codex },
-      {
-        autos: [
-          {
-            preferredModels: ["claude-sonnet-4.6", "claude-haiku-4.5"],
-            noReasoning: ["claude-haiku-4.5"],
-          },
-        ],
-      },
-      "ses_auto_claude_1",
-      {
-        predicted_label: "no_reasoning",
-        candidate_models: ["gpt-5.3-codex", "claude-sonnet-4-6-20250929", "claude-haiku-4-5-20251001"],
-        confidence: 0.87,
-      },
-      "auto-claude",
-    )
-    expect(output.options.model).toBe("claude-haiku-4-5-20251001")
+  test("replaying the transform never anchors an auto on another auto", async () => {
+    const { store, runTransforms } = await setup(catalog)
+    runTransforms()
+    runTransforms()
+    expect(store.get("auto")!.modelID).toBe("gpt-5.4")
+    expect(store.get("auto-2")).toBeUndefined()
   })
 
-  test("configured gpt auto stays in gpt family", async () => {
-    const { output } = await callChatParamsWithRouting(
-      { "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex },
-      { autos: [{ name: "Auto GPT/Codex", preferredModels: ["gpt-5.3-codex"] }] },
-      "ses_auto_gpt_1",
-      {
-        predicted_label: "no_reasoning",
-        candidate_models: ["claude-sonnet-4-6-20250929", "gpt-5.3-codex"],
-        confidence: 0.89,
-      },
-      "auto-gpt-codex",
-    )
-    expect(output.options.model).toBe("gpt-5.3-codex")
-  })
-
-  test("keeps routing cache separate per auto within one session", async () => {
-    const origFetch = globalThis.fetch
-    const models = { "claude-sonnet-4.6": sonnet, "claude-haiku-4.5": haiku, "gpt-5.3-codex": codex }
-    const availableModels = Object.values(models)
-      .filter((m) => (m as { providerID: string }).providerID === "github-copilot")
-      .map((m) => (m as { api: { id: string } }).api.id)
-    const mockSession = {
-      session_token: "test-session-token",
-      selected_model: availableModels[0],
-      available_models: availableModels,
-      expires_at: Math.floor(Date.now() / 1000) + 3600,
-    }
-    const intents = [
-      {
-        predicted_label: "no_reasoning",
-        candidate_models: ["gpt-5.3-codex", "claude-sonnet-4-6-20250929", "claude-haiku-4-5-20251001"],
-        confidence: 0.94,
-      },
-      {
-        predicted_label: "no_reasoning",
-        candidate_models: ["claude-sonnet-4-6-20250929", "gpt-5.3-codex"],
-        confidence: 0.88,
-      },
-    ]
-    let intentCalls = 0
-    globalThis.fetch = (async (url: string | URL | Request, _init?: RequestInit): Promise<Response> => {
-      const u = url.toString()
-      if (u.includes("/models/session/intent")) {
-        const payload = intents[intentCalls]
-        intentCalls += 1
-        return new Response(JSON.stringify(payload), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        })
-      }
-      if (u.includes("/models/session"))
-        return new Response(JSON.stringify(mockSession), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        })
-      return origFetch(url, _init)
-    }) as unknown as typeof fetch
-
-    try {
-      const hooks = await plugin.server(
-        {
-          client: { tui: { showToast: async () => undefined } },
-        } as never,
-        {
-          autos: [
-            {
-              preferredModels: ["claude-sonnet-4.6", "claude-haiku-4.5"],
-              noReasoning: ["claude-haiku-4.5"],
-            },
-            { name: "Auto GPT/Codex", preferredModels: ["gpt-5.3-codex"] },
-          ],
-        },
-      )
-      const resolved = await hooks.provider!.models!({ id: "github-copilot", models } as never, oauth)
-      await hooks["chat.message"]!(
-        { sessionID: "ses_shared" } as never,
-        { parts: [{ type: "text", text: "test prompt" }] } as never,
-      )
-
-      const claudeOutput = makeOutput()
-      await hooks["chat.params"]!(
-        {
-          sessionID: "ses_shared",
-          agent: "build",
-          model: resolved["auto-claude"],
-          provider: { source: "config", info: {} as never, options: {} },
-          message: {} as never,
-        },
-        claudeOutput,
-      )
-
-      const gptOutput = makeOutput()
-      await hooks["chat.params"]!(
-        {
-          sessionID: "ses_shared",
-          agent: "build",
-          model: resolved["auto-gpt-codex"],
-          provider: { source: "config", info: {} as never, options: {} },
-          message: {} as never,
-        },
-        gptOutput,
-      )
-
-      expect(claudeOutput.options.model).toBe("claude-haiku-4-5-20251001")
-      expect(gptOutput.options.model).toBe("gpt-5.3-codex")
-      expect(intentCalls).toBe(2)
-    } finally {
-      globalThis.fetch = origFetch
-    }
-  })
-
-  test("keeps the missing-pool fallback route sticky across turns", async () => {
-    const origFetch = globalThis.fetch
-    // Session pool omits gemini, so the auto-gemini route takes the missing-pool
-    // fallback path. Each turn's router verdict differs; a sticky route must keep the
-    // first turn's model (KV cache stability) and not re-query the router.
-    const intents = [
-      { predicted_label: "no_reasoning", candidate_models: ["gpt-5.3-codex"], confidence: 0.9 },
-      { predicted_label: "needs_reasoning", candidate_models: ["gpt-5.3-codex"], confidence: 0.9 },
-    ]
-    let intentCalls = 0
-    globalThis.fetch = (async (url: string | URL | Request, _init?: RequestInit): Promise<Response> => {
-      const u = url.toString()
-      if (u.includes("/models/session/intent")) {
-        const payload = intents[Math.min(intentCalls, intents.length - 1)]
-        intentCalls += 1
-        return new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } })
-      }
-      if (u.includes("/models/session"))
-        return new Response(
-          JSON.stringify({
-            session_token: "test-session-token",
-            selected_model: "claude-sonnet-4-6-20250929",
-            available_models: ["claude-sonnet-4-6-20250929", "gpt-5.3-codex"],
-            expires_at: Math.floor(Date.now() / 1000) + 3600,
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        )
-      return origFetch(url, _init)
-    }) as unknown as typeof fetch
-
-    try {
-      const hooks = await plugin.server(
-        { client: { tui: { showToast: async () => undefined } } } as never,
-        {
-          autos: [
-            {
-              name: "Auto Gemini",
-              preferredModels: ["gemini-3.1-pro", "gemini-3.5-flash"],
-              reasoning: ["gemini-3.1-pro"],
-              noReasoning: ["gemini-3.5-flash"],
-            },
-          ],
-        },
-      )
-      const resolved = await hooks.provider!.models!(
-        {
-          id: "github-copilot",
-          models: {
-            "claude-sonnet-4.6": sonnet,
-            "gpt-5.3-codex": codex,
-            "gemini-3.1-pro": geminiPro,
-            "gemini-3.5-flash": geminiFlash,
-          },
-        } as never,
-        oauth,
-      )
-
-      const runTurn = async () => {
-        await hooks["chat.message"]!(
-          { sessionID: "ses_gemini_sticky" } as never,
-          { parts: [{ type: "text", text: "test prompt" }] } as never,
-        )
-        const context = {
-          sessionID: "ses_gemini_sticky",
-          agent: "build",
-          model: resolved["auto-gemini"],
-          provider: { source: "config" as const, info: {} as never, options: {} },
-          message: {} as never,
-        }
-        const paramsOutput = makeOutput()
-        await hooks["chat.params"]!(context, paramsOutput)
-        const headersOutput = makeOutput()
-        await hooks["chat.headers"]!(context, headersOutput)
-        return { paramsOutput, headersOutput }
-      }
-
-      const turn0 = await runTurn()
-      const turn1 = await runTurn()
-
-      expect(turn0.paramsOutput.options.model).toBe("gemini-3.5-flash")
-      // Sticky: turn 1 must reuse turn 0's model despite the flipped verdict.
-      expect(turn1.paramsOutput.options.model).toBe("gemini-3.5-flash")
-      // The session token stays omitted on the sticky turn too.
-      expect(turn0.headersOutput.headers["Copilot-Session-Token"]).toBeUndefined()
-      expect(turn1.headersOutput.headers["Copilot-Session-Token"]).toBeUndefined()
-      expect(intentCalls).toBe(1)
-    } finally {
-      globalThis.fetch = origFetch
-    }
-  })
-
-  test("dedupes derived ids and names for same-family autos", async () => {
-    const models = await callHook(
-      { "claude-sonnet-4.6": sonnet, "claude-haiku-4.5": haiku },
-      {
-        autos: [
-          { preferredModels: ["claude-sonnet-4.6"] },
-          { preferredModels: ["claude-haiku-4.5"] },
-        ],
-      },
-    )
-    // Both anchor on the Claude family, so ids/names must be disambiguated.
-    expect(models["auto-claude"]).toBeDefined()
-    expect(models["auto-claude-2"]).toBeDefined()
-    expect(models["auto-claude"].name).toBe("Auto Claude")
-    expect(models["auto-claude-2"].name).toBe("Auto Claude 2")
-    // Legacy auto is untouched.
-    expect(models.auto.id).toBe("auto")
-    expect(models.auto.name).toBe("Auto")
-  })
-
-  test("derives a unique id when a configured name collides with the legacy auto", async () => {
-    const models = await callHook(
-      { "claude-sonnet-4.6": sonnet, "gpt-5.3-codex": codex },
-      { autos: [{ name: "Auto" }] },
-    )
-    expect(models.auto.name).toBe("Auto")
-    expect(models["auto-2"]).toBeDefined()
-    expect(models["auto-2"].name).toBe("Auto 2")
+  test("preferredModels anchors by model key, in order", async () => {
+    const { store } = await setup(catalog, { preferredModels: ["nope", "gpt-6-luna"] })
+    expect(store.get("auto")!.modelID).toBe("gpt-6-luna")
   })
 
   test("injects default family autos when autos is not configured", async () => {
-    const models = await callHook({
-      "claude-sonnet-4.6": sonnet,
-      "claude-haiku-4.5": haiku,
-      "gpt-5.3-codex": codex,
-      "gpt-5.4": gpt54,
-    })
-    expect(models.auto.name).toBe("Auto")
-    expect(models["auto-claude"].name).toBe("Auto Claude")
-    expect(models["auto-claude"].api.npm).toBe("@ai-sdk/anthropic")
-    expect(models["auto-gpt"].name).toBe("Auto GPT")
-    expect(models["auto-gpt"].api.npm).toBe("@ai-sdk/github-copilot")
+    const { store } = await setup(catalog)
+    expect(store.get("auto-claude")!.name).toBe("Auto Claude")
+    expect(store.get("auto-gpt")!.name).toBe("Auto GPT")
   })
 
   test("autos: [] disables the default family autos", async () => {
-    const models = await callHook(
-      {
-        "claude-sonnet-4.6": sonnet,
-        "claude-haiku-4.5": haiku,
-        "gpt-5.3-codex": codex,
-        "gpt-5.4": gpt54,
-      },
-      { autos: [] },
-    )
-    expect(models.auto).toBeDefined()
-    expect(models["auto-claude"]).toBeUndefined()
-    expect(models["auto-gpt"]).toBeUndefined()
+    const { store } = await setup(catalog, { autos: [] })
+    expect(store.get("auto-claude")).toBeUndefined()
+    expect(store.get("auto-gpt")).toBeUndefined()
+    expect(store.get("auto")).toBeDefined()
   })
 
-  test("explicit autos replace the default family autos", async () => {
-    const models = await callHook(
-      {
-        "claude-sonnet-4.6": sonnet,
-        "claude-haiku-4.5": haiku,
-        "gpt-5.3-codex": codex,
-        "gpt-5.4": gpt54,
-      },
-      { autos: [{ name: "Auto GPT/Codex", preferredModels: ["gpt-5.3-codex"] }] },
-    )
-    expect(models["auto-gpt-codex"]).toBeDefined()
-    expect(models["auto-claude"]).toBeUndefined()
-    expect(models["auto-gpt"]).toBeUndefined()
+  test("explicit autos replace the defaults", async () => {
+    const { store } = await setup(catalog, { autos: [{ name: "Smart", preferredModels: ["claude-sonnet-5.5"] }] })
+    expect(store.get("smart")!.modelID).toBe("claude-sonnet-5.5")
+    expect(store.get("auto-gpt")).toBeUndefined()
   })
 
-  test("skips default auto for a family with fewer than two models", async () => {
-    const models = await callHook({
-      "claude-sonnet-4.6": sonnet,
-      "gpt-5.3-codex": codex,
-      "gpt-5.4": gpt54,
-    })
-    expect(models["auto-gpt"]).toBeDefined()
-    expect(models["auto-claude"]).toBeUndefined()
+  test("skips a default auto for a family with fewer than two models", async () => {
+    const { store } = await setup([sonnet, gpt54, luna])
+    expect(store.get("auto-claude")).toBeUndefined()
+    expect(store.get("auto-gpt")).toBeDefined()
   })
 
   test("does not inject a default gemini auto", async () => {
-    const models = await callHook({
-      "claude-sonnet-4.6": sonnet,
-      "claude-haiku-4.5": haiku,
-      "gemini-3.1-pro": geminiPro,
-      "gemini-3.5-flash": geminiFlash,
+    const { store } = await setup([...catalog, gemini, geminiFlash])
+    expect(store.get("auto-gemini")).toBeUndefined()
+  })
+
+  test("dedupes derived ids and names", async () => {
+    const { store } = await setup(catalog, {
+      autos: [{ preferredModels: ["claude-sonnet-5.5"] }, { preferredModels: ["claude-haiku-5.5"] }, { name: "Auto" }],
     })
-    expect(models["auto-claude"]).toBeDefined()
-    expect(models["auto-gemini"]).toBeUndefined()
+    expect(store.get("auto-claude")!.name).toBe("Auto Claude")
+    expect(store.get("auto-claude-2")!.name).toBe("Auto Claude 2")
+    expect(store.get("auto-2")!.name).toBe("Auto 2")
   })
 
-  test("default claude auto routes within the claude family", async () => {
-    const { output } = await callChatParamsWithRouting(
-      {
-        "claude-sonnet-4.6": sonnet,
-        "claude-haiku-4.5": haiku,
-        "gpt-5.3-codex": codex,
-        "gpt-5.4": gpt54,
-      },
-      {},
-      "ses_default_claude",
-      {
-        predicted_label: "no_reasoning",
-        candidate_models: ["gpt-5.4", "gpt-5.3-codex", "claude-haiku-4-5-20251001", "claude-sonnet-4-6-20250929"],
-        confidence: 0.9,
-      },
-      "auto-claude",
-    )
-    // Cross-family candidates are filtered out; the top claude candidate wins.
-    expect(output.options.model).toBe("claude-haiku-4-5-20251001")
+  test("scopes request hooks to the Copilot provider", async () => {
+    const { hooks } = await setup(catalog)
+    for (const name of ["context", "compaction", "model.request", "http.request"])
+      expect(hooks.get(name)?.providerID).toBe("github-copilot")
+  })
+})
+
+describe("routing via POST /auto", () => {
+  test("without a Copilot OAuth connection uses the anchor and sends no token", async () => {
+    await withFetch({ auto: autoPicks("gpt-6-luna") }, async (calls) => {
+      const { turn } = await setup(catalog, {}, null)
+      const result = await turn("auto")
+      expect(result.model).toBe("gpt-5.4")
+      expect(result.token).toBeUndefined()
+      expect(calls).toHaveLength(0)
+    })
   })
 
-  test("default gpt auto routes within the gpt family", async () => {
-    const { output } = await callChatParamsWithRouting(
-      {
-        "claude-sonnet-4.6": sonnet,
-        "claude-haiku-4.5": haiku,
-        "gpt-5.3-codex": codex,
-        "gpt-5.4": gpt54,
-      },
-      {},
-      "ses_default_gpt",
-      {
-        predicted_label: "no_reasoning",
-        candidate_models: ["claude-haiku-4-5-20251001", "gpt-5.4", "gpt-5.3-codex"],
-        confidence: 0.9,
-      },
-      "auto-gpt",
-    )
-    expect(output.options.model).toBe("gpt-5.4")
+  test("sends prompt and default tier, then routes the request to the selected model", async () => {
+    await withFetch({ auto: autoPicks("gpt-6-luna") }, async (calls) => {
+      const { turn } = await setup(catalog)
+      const result = await turn("auto", { prompt: "rename this variable" })
+      expect(calls).toHaveLength(1)
+      expect(calls[0].body).toEqual({ prompt: "rename this variable", tier: "balance" })
+      expect(calls[0].headers["X-GitHub-Api-Version"]).toBe("2026-08-01")
+      expect(calls[0].headers.Authorization).toBe("Bearer test-bearer")
+      expect(result.model).toBe("gpt-6-luna")
+      expect(result.token).toBe("tok-gpt-6-luna")
+      expect(result.contentLength).toBeNull()
+      expect(result.temperature).toBeUndefined()
+      expect(result.options).toEqual({})
+    })
   })
 
-  test("default family auto omits session token when its family is missing from the pool", async () => {
+  test("uses the enterprise endpoint from the credential", async () => {
+    const urls: string[] = []
     const origFetch = globalThis.fetch
-    globalThis.fetch = (async (url: string | URL | Request, _init?: RequestInit): Promise<Response> => {
-      const u = url.toString()
-      if (u.includes("/models/session/intent"))
-        return new Response(
-          JSON.stringify({ predicted_label: "no_reasoning", candidate_models: ["gpt-5.4"], confidence: 0.9 }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        )
-      if (u.includes("/models/session"))
-        return new Response(
-          JSON.stringify({
-            session_token: "test-session-token",
-            selected_model: "gpt-5.4",
-            available_models: ["gpt-5.4", "gpt-5.3-codex"],
-            expires_at: Math.floor(Date.now() / 1000) + 3600,
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        )
-      return origFetch(url, _init)
-    }) as unknown as typeof fetch
-
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      urls.push(url.toString())
+      return Response.json(autoPicks("gpt-6-luna")())
+    }) as typeof fetch
     try {
-      const hooks = await plugin.server(
-        { client: { tui: { showToast: async () => undefined } } } as never,
-        {},
-      )
-      const resolved = await hooks.provider!.models!(
-        {
-          id: "github-copilot",
-          models: {
-            "claude-sonnet-4.6": sonnet,
-            "claude-haiku-4.5": haiku,
-            "gpt-5.3-codex": codex,
-            "gpt-5.4": gpt54,
-          },
-        } as never,
-        oauth,
-      )
-      await hooks["chat.message"]!(
-        { sessionID: "ses_default_missing_family" } as never,
-        { parts: [{ type: "text", text: "test prompt" }] } as never,
-      )
-      const context = {
-        sessionID: "ses_default_missing_family",
-        agent: "build",
-        model: resolved["auto-claude"],
-        provider: { source: "config" as const, info: {} as never, options: {} },
-        message: {} as never,
-      }
-      const paramsOutput = makeOutput()
-      await hooks["chat.params"]!(context, paramsOutput)
-      const headersOutput = makeOutput()
-      await hooks["chat.headers"]!(context, headersOutput)
-
-      // Claude vanished from the pool: fall back to the catalog anchor, without the token.
-      expect(paramsOutput.options.model).toBe("claude-sonnet-4-6-20250929")
-      expect(headersOutput.headers["Copilot-Session-Token"]).toBeUndefined()
+      const { turn } = await setup(catalog, {}, { ...oauth, metadata: { enterpriseUrl: "https://acme.ghe.com/" } })
+      await turn("auto")
+      expect(urls).toEqual(["https://copilot-api.acme.ghe.com/auto"])
     } finally {
       globalThis.fetch = origFetch
     }
   })
+
+  test("sends the configured tier (retired names mapped forward) and boosts effort on intelligence", async () => {
+    await withFetch({ auto: autoPicks("gpt-6.1-sol") }, async (calls) => {
+      const { turn } = await setup(catalog, { tier: "max" })
+      const result = await turn("auto")
+      expect(calls[0].body.tier).toBe("intelligence")
+      expect(result.options).toEqual({ reasoningEffort: "high", reasoningSummary: "auto" })
+    })
+  })
+
+  test("intelligence tier on a Claude auto enables extended thinking", async () => {
+    await withFetch({ auto: autoPicks("claude-sonnet-5.5") }, async () => {
+      const { turn } = await setup(catalog, { autos: [{ name: "Claude Max", preferredModels: ["claude-sonnet-5.5"], tier: "intelligence" }] })
+      const result = await turn("claude-max")
+      expect(result.options.thinking).toEqual({ type: "enabled", budgetTokens: 16000 })
+    })
+  })
+
+  test("flags image attachments with has_image", async () => {
+    await withFetch({ auto: autoPicks("gpt-6-luna") }, async (calls) => {
+      const { turn } = await setup(catalog)
+      await turn("auto", { files: [{ uri: "file:///tmp/screenshot.png" }] })
+      expect(calls[0].body.has_image).toBe(true)
+    })
+  })
+
+  test("sticks with the first route for the rest of the conversation", async () => {
+    let pick = "gpt-6-luna"
+    await withFetch({ auto: () => autoPicks(pick)() }, async (calls) => {
+      const { turn } = await setup(catalog)
+      await turn("auto")
+      pick = "gpt-6.1-sol"
+      const second = await turn("auto", { prompt: "follow-up" })
+      const toolStep = await turn("auto", { prompt: undefined })
+      expect(calls).toHaveLength(1)
+      expect(second.model).toBe("gpt-6-luna")
+      expect(toolStep.token).toBe("tok-gpt-6-luna")
+    })
+  })
+
+  test("re-routes on the next agent turn after compaction, not for the compaction itself", async () => {
+    let pick = "gpt-6-luna"
+    await withFetch({ auto: () => autoPicks(pick)() }, async (calls) => {
+      const { turn } = await setup(catalog)
+      await turn("auto")
+      pick = "gpt-6.1-sol"
+      const compaction = await turn("auto", { prompt: undefined, kind: "compaction" })
+      expect(compaction.model).toBe("gpt-6-luna")
+      const after = await turn("auto")
+      expect(calls).toHaveLength(2)
+      expect(after.model).toBe("gpt-6.1-sol")
+    })
+  })
+
+  test("re-routes when the session token is about to expire", async () => {
+    await withFetch({ auto: autoPicks("gpt-6-luna", 60) }, async (calls) => {
+      const { turn } = await setup(catalog)
+      await turn("auto")
+      await turn("auto")
+      expect(calls).toHaveLength(2)
+    })
+  })
+
+  test("routes each auto separately within one session", async () => {
+    await withFetch({ auto: autoPicks("claude-haiku-5.5") }, async (calls) => {
+      const { turn } = await setup(catalog)
+      const claude = await turn("auto-claude")
+      await turn("auto-claude")
+      const gpt = await turn("auto-gpt")
+      expect(calls).toHaveLength(2)
+      expect(claude.model).toBe("claude-haiku-5.5")
+      expect(claude.token).toBe("tok-claude-haiku-5.5")
+      expect(gpt.model).toBe("gpt-5.4")
+      expect(gpt.token).toBeUndefined()
+    })
+  })
+
+  test("a pick on another endpoint falls back to the anchor without a token and stays sticky", async () => {
+    await withFetch({ auto: autoPicks("gpt-6-luna") }, async (calls) => {
+      const { turn } = await setup(catalog)
+      const first = await turn("auto-claude")
+      const second = await turn("auto-claude")
+      expect(first.model).toBe("claude-sonnet-5.5")
+      expect(first.token).toBeUndefined()
+      expect(second.model).toBe("claude-sonnet-5.5")
+      expect(calls).toHaveLength(1)
+    })
+  })
+
+  test("judges the pick against a catalog swapped in while routing", async () => {
+    // opencode first builds the catalog without an account endpoint, then replays
+    // the transform with the live one (e.g. a business endpoint) during the request.
+    const BUSINESS = "https://api.business.githubcopilot.com"
+    const models: FakeModel[] = catalog.map((m) => ({ ...structuredClone(m), settings: { endpoint: m.settings.endpoint } }))
+    const live = () => {
+      models.splice(0, models.length, ...catalog.map((m) => ({ ...structuredClone(m), settings: { ...m.settings, baseURL: BUSINESS } })))
+      runTransforms()
+      return autoPicks("gpt-6-luna")()
+    }
+    let runTransforms = () => {}
+    await withFetch({ auto: live }, async () => {
+      const harness = await setup(models)
+      runTransforms = harness.runTransforms
+      const result = await harness.turn("auto")
+      expect(result.model).toBe("gpt-6-luna")
+      expect(result.token).toBe("tok-gpt-6-luna")
+    })
+  })
+
+  test("a pick on another wire API falls back to the anchor", async () => {
+    await withFetch({ auto: autoPicks("gemini-3.1-pro") }, async () => {
+      const { turn } = await setup([...catalog, gemini])
+      const result = await turn("auto")
+      expect(result.model).toBe("gpt-5.4")
+      expect(result.token).toBeUndefined()
+    })
+  })
+
+  test("a family-clamped auto ignores another family on the same endpoint", async () => {
+    await withFetch({ auto: autoPicks("mai-code-1.1-flash") }, async () => {
+      const { turn } = await setup([...catalog, mai])
+      const gpt = await turn("auto-gpt", { sessionID: "a" })
+      const unclamped = await turn("auto", { sessionID: "b" })
+      expect(gpt.model).toBe("gpt-5.4")
+      expect(gpt.token).toBeUndefined()
+      expect(unclamped.model).toBe("mai-code-1.1-flash")
+      expect(unclamped.token).toBe("tok-mai-code-1.1-flash")
+    })
+  })
+
+  test("a pick missing from the catalog falls back to the anchor", async () => {
+    await withFetch({ auto: autoPicks("gpt-9") }, async () => {
+      const { turn } = await setup(catalog)
+      const result = await turn("auto")
+      expect(result.model).toBe("gpt-5.4")
+      expect(result.token).toBeUndefined()
+    })
+  })
+
+  test("leaves non-auto models alone", async () => {
+    await withFetch({ auto: autoPicks("gpt-6-luna") }, async (calls) => {
+      const { turn } = await setup(catalog)
+      const result = await turn("gpt-5.4")
+      expect(result.model).toBe("gpt-5.4")
+      expect(result.token).toBeUndefined()
+      expect(result.contentLength).toBe("999")
+      expect(result.temperature).toBe(0.7)
+      expect(calls).toHaveLength(0)
+    })
+  })
 })
 
-// Packaging guards for the supported (local-path) install. opencode loads the
-// plugin from the file referenced in config: dist/index.js (after `bun run build`)
-// or src/index.ts dropped into ~/.config/opencode/plugins/. Either way opencode's
-// loader requires a default export of `{ id, server: <function> }`. (The `github:`
-// install path is intentionally unsupported: opencode git-clones the repo on every
-// launch and disposes short-lived commands before the clone finishes, so arborist
-// rolls the partial install back — a local path resolves with a cheap stat instead.)
+describe("legacy /models/session fallback", () => {
+  const legacyPool = (models: string[]) => () => ({
+    session_token: "tok-legacy",
+    expires_at: Math.floor(Date.now() / 1000) + 1800,
+    available_models: models,
+  })
+
+  test("uses the legacy pool when POST /auto fails", async () => {
+    await withFetch({ auto: () => 404, legacy: legacyPool(["claude-haiku-5.5", "gpt-5.4"]) }, async (calls) => {
+      const { turn } = await setup(catalog)
+      const result = await turn("auto")
+      expect(calls.map((c) => c.kind)).toEqual(["auto", "legacy"])
+      expect(result.model).toBe("gpt-5.4")
+      expect(result.token).toBe("tok-legacy")
+    })
+  })
+
+  test("prefers a configured model from the legacy pool", async () => {
+    await withFetch({ auto: () => 503, legacy: legacyPool(["gpt-5.4", "gpt-6-luna"]) }, async () => {
+      const { turn } = await setup(catalog, { preferredModels: ["gpt-6-luna"] })
+      const result = await turn("auto")
+      expect(result.model).toBe("gpt-6-luna")
+    })
+  })
+
+  test("falls back to the anchor and retries next turn when both calls fail", async () => {
+    await withFetch({ auto: () => 500, legacy: () => 500 }, async (calls) => {
+      const { turn } = await setup(catalog)
+      const first = await turn("auto")
+      expect(first.model).toBe("gpt-5.4")
+      expect(first.token).toBeUndefined()
+      await turn("auto")
+      expect(calls.filter((c) => c.kind === "auto")).toHaveLength(2)
+    })
+  })
+})
+
+// Packaging guards: opencode 2 loads the package entry and requires a default export
+// of `{ id, setup }` (Plugin.define's shape).
 describe("packaging", () => {
   const root = path.join(import.meta.dir, "..")
   const entry = (pkg as { exports?: { ["."]?: { import?: string } }; main?: string }).exports?.["."]?.import ?? pkg.main
@@ -870,10 +498,13 @@ describe("packaging", () => {
     expect(existsSync(path.join(root, rel))).toBe(true)
   })
 
-  test("default export has the shape opencode loads (id + server function)", () => {
-    expect(typeof plugin).toBe("object")
+  test("default export has the shape opencode 2 loads (id + setup function)", () => {
     expect(typeof plugin.id).toBe("string")
     expect(plugin.id.length).toBeGreaterThan(0)
-    expect(typeof plugin.server).toBe("function")
+    expect(typeof plugin.setup).toBe("function")
+  })
+
+  test("declares no runtime dependencies", () => {
+    expect((pkg as { dependencies?: object }).dependencies).toBeUndefined()
   })
 })

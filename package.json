@@ -1,7 +1,7 @@
 {
   "name": "opencode-github-copilot-auto-model",
-  "version": "0.2.0",
-  "description": "Expose GitHub Copilot's Auto model in opencode's model picker",
+  "version": "2.0.0",
+  "description": "Expose GitHub Copilot's Auto model in opencode 2's model picker",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -15,16 +15,15 @@
     "README.md"
   ],
   "scripts": {
-    "build": "bun build ./src/index.ts --outfile ./dist/index.js --target node --format esm --external @opencode-ai/plugin --external @opencode-ai/sdk",
-    "dev": "bun build ./src/index.ts --outfile ./dist/index.js --target node --format esm --external @opencode-ai/plugin --external @opencode-ai/sdk --watch",
+    "build": "bun build ./src/index.ts --outfile ./dist/index.js --target node --format esm",
+    "dev": "bun build ./src/index.ts --outfile ./dist/index.js --target node --format esm --watch",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "prepublishOnly": "bun run typecheck && bun test && bun run build",
     "release": "npm login --auth-type=web && npm publish"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "*",
-    "@opencode-ai/sdk": "*",
+    "@opencode/plugin": "2.0.30",
     "@types/bun": "latest",
     "typescript": "^5.5.0"
   },
