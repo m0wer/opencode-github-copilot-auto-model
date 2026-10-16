@@ -8,13 +8,12 @@ import type { Model } from "@opencode-ai/sdk/v2"
 const MODEL_ID = "auto"
 const PROVIDER_ID = "github-copilot"
 
-// VS Code's copilot-api uses "2026-06-01". The previously-working value here was
-// "2026-01-09" — flip back if the session/intent calls start 4xx'ing.
-const COPILOT_API_VERSION = "2026-06-01"
+// Matches `@vscode/copilot-api` 0.5.x (`_mixinHeaders`), which VS Code uses for POST /auto.
+const COPILOT_API_VERSION = "2026-08-01"
 
 // VS Code (`@vscode/copilot-api` _mixinHeaders) ALWAYS stamps these on the gated
-// /models/session and /models/session/intent requests — they are never omitted.
-// Values are plausible stand-ins generated once per process.
+// /auto request — they are never omitted. Values are plausible stand-ins generated
+// once per process.
 // Editor-Version / Editor-Plugin-Version are currently NOT sent (testing whether the
 // CAPI auto endpoints need them). Uncomment these + the header lines to restore the
 // real VS Code baseline.
@@ -24,62 +23,71 @@ const VSCODE_SESSION_ID = `${randomUUID()}${Date.now()}`
 const VSCODE_MACHINE_ID = randomUUID().replace(/-/g, "")
 const VSCODE_DEVICE_ID = randomUUID()
 
-// The router endpoint aborts at 1s in VS Code; mirror that so a slow/blocked
-// intent call never stalls a turn.
-const INTENT_TIMEOUT_MS = 1000
+// VS Code's AutoV2Fetcher aborts POST /auto after 5s.
+const AUTO_TIMEOUT_MS = 5000
 
-// Refresh a session token this long before its server expiry.
-const SESSION_REFRESH_SKEW_MS = 60_000
+// VS Code renews an auto session this long before its server expiry, so a long
+// request cannot outlive its token.
+const SESSION_REFRESH_SKEW_MS = 5 * 60_000
 
-// Parsed POST /models/session response — one per conversation, like VS Code's token bank.
+// Routing profiles accepted by POST /auto (VS Code's autoModeTiers.ts). A tier is
+// picked per session and biases which models the server may choose from.
+const AUTO_TIERS = ["efficiency", "balance", "intelligence", "fast"] as const
+type AutoTier = (typeof AUTO_TIERS)[number]
+const DEFAULT_TIER: AutoTier = "balance"
+// Retired names the server still accepts; VS Code maps them forward on read.
+const RETIRED_TIERS: Record<string, AutoTier> = { eco: "efficiency", balanced: "balance", max: "intelligence" }
+
+// A server routing result: the model(s) the auto session may bill, plus the session
+// token that places chat requests in Copilot's auto pool (and its discount).
 type AutoSession = {
-  selectedModelID: string
+  // "auto": POST /auto picked exactly one model for the prompt.
+  // "legacy": POST /models/session returned a pool; used only when /auto fails.
+  source: "auto" | "legacy"
+  models: string[]
   sessionToken: string
-  availableModels: string[]
-  discountedCosts: Record<string, number>
   expiresAtMs: number
 }
 
-// Everything we track per opencode conversation: its auto session (token + pool)
-// plus routing memory (turn count, last decision, context signals).
-type ConvState = {
-  session?: AutoSession
-  sessionInflight?: Promise<AutoSession | undefined>
-  lastPrompt?: string
-  referenceCount?: number
-  routedModelID?: string
-  routedLabel?: "needs_reasoning" | "no_reasoning"
-  needsReEval?: boolean
-  omitSessionToken?: boolean
-  previousModel?: string
-  turn: number
+// The model a conversation is pinned to. `sessionToken` is only set when the server
+// routed to that exact model; fallbacks are sent without it (out-of-session models
+// are rejected when they carry the token).
+type Route = {
+  modelID: string
+  sessionToken?: string
+  expiresAtMs: number
 }
 
-// Shape of POST /models/session/intent (router) response. See routerDecisionFetcher.ts.
-type RouterDecision = {
-  predicted_label?: "needs_reasoning" | "no_reasoning"
-  confidence?: number
-  candidate_models?: string[]
-  scores?: { needs_reasoning: number; no_reasoning: number }
-  sticky_override?: boolean
+// Everything we track per opencode conversation and auto: the pinned route plus the
+// inputs for the next routing round.
+type ConvState = {
+  route?: Route
+  routing?: Promise<Route>
+  lastPrompt?: string
+  hasImage?: boolean
+  needsReEval?: boolean
 }
 
 type AutoConfig = {
   id?: string
   name?: string
   preferredModels?: string[]
+  tier?: string
+  /** @deprecated POST /auto returns no reasoning verdict; ignored. */
   reasoning?: string[]
+  /** @deprecated POST /auto returns no reasoning verdict; ignored. */
   noReasoning?: string[]
 }
 
 type Options = {
-  // Ordered list of preferred model keys or API ids to use as the session anchor
-  // and routing fallback, regardless of routing label.
+  // Ordered list of preferred model keys or API ids. The first one anchors the
+  // auto's endpoint and is the fallback when the server's pick cannot be served.
   preferredModels?: string[]
-  // Per-label preference lists: steer candidate selection per routing verdict.
-  // Only within-family candidates are valid (the auto model has a single endpoint).
-  // Cross-family entries are silently skipped.
+  // Routing profile sent to POST /auto: efficiency | balance | intelligence | fast.
+  tier?: string
+  /** @deprecated POST /auto returns no reasoning verdict; ignored. */
   reasoning?: string[]
+  /** @deprecated POST /auto returns no reasoning verdict; ignored. */
   noReasoning?: string[]
   // Additional injected autos. Each one anchors independently based on its own
   // preferred model list and keeps its own routing/session cache.
@@ -93,8 +101,7 @@ type AutoDraft = {
   requestedID?: string
   requestedName?: string
   preferredModels: string[]
-  reasoning: string[]
-  noReasoning: string[]
+  tier?: string
   legacy: boolean
   index: number
   // Clamp this auto to one family label (e.g. "Claude"). Used by the default
@@ -112,22 +119,28 @@ type TemplateAPI = {
 type InjectedAuto = {
   id: string
   name: string
-  preferredModels: string[]
-  reasoning: string[]
-  noReasoning: string[]
   preferredApiIDs: string[]
-  reasoningApiIDs: string[]
-  noReasoningApiIDs: string[]
-  template?: Model
-  templateApi?: TemplateAPI
-  catalogDefaultModelID?: string
+  tier: AutoTier
+  template: Model
+  templateApi: TemplateAPI
+  catalogDefaultModelID: string
   familyFilter?: string
 }
 
+// Unclamped autos anchor on the shared Copilot transport when possible: GPT, MAI and
+// Gemini all ride @ai-sdk/github-copilot (models.dev lists them as @ai-sdk/openai), so
+// it can serve most of what /auto picks.
+const SHARED_TRANSPORTS = ["@ai-sdk/github-copilot", "@ai-sdk/openai"]
+
 function pickTemplate(models: Record<string, Model>, familyFilter?: string) {
-  return Object.values(models).find(
+  const candidates = Object.values(models).filter(
     (m) => m.providerID === PROVIDER_ID && (!familyFilter || familyLabel(m) === familyFilter),
   )
+  for (const npm of SHARED_TRANSPORTS) {
+    const match = candidates.find((m) => m.api.npm === npm)
+    if (match) return match
+  }
+  return candidates[0]
 }
 
 function templateAPI(model: Model): TemplateAPI {
@@ -142,6 +155,15 @@ function normalizeList(values: string[] | undefined): string[] {
     if (s && !deduped.includes(s)) deduped.push(s)
   }
   return deduped
+}
+
+function normalizeTier(value: string | undefined): AutoTier {
+  const raw = value?.trim().toLowerCase()
+  if (!raw) return DEFAULT_TIER
+  const tier = RETIRED_TIERS[raw] ?? raw
+  if ((AUTO_TIERS as readonly string[]).includes(tier)) return tier as AutoTier
+  log(`ignoring unknown tier "${value}"; using ${DEFAULT_TIER}`)
+  return DEFAULT_TIER
 }
 
 function resolvePreferredApiIDs(models: Record<string, Model>, preferred: string[]): string[] {
@@ -160,12 +182,12 @@ function resolvePreferredApiIDs(models: Record<string, Model>, preferred: string
 }
 
 // Families injected as per-family autos when `autos` is not configured. Claude and
-// GPT/Codex are the two families with true Copilot auto-session support; Gemini and
-// others stay opt-in because their best-effort path needs configured preferences.
+// GPT/Codex are the two families Copilot's Auto routes to; Gemini and others stay
+// opt-in.
 const DEFAULT_AUTO_FAMILIES = ["Claude", "GPT"]
 
 // One default auto per supported family that has at least two catalog models
-// (the within-family router needs a strong + fast tier to choose between).
+// (with a single model the auto adds nothing over picking that model directly).
 function defaultFamilyDrafts(models: Record<string, Model>): AutoDraft[] {
   const counts = new Map<string, number>()
   for (const model of Object.values(models)) {
@@ -179,8 +201,6 @@ function defaultFamilyDrafts(models: Record<string, Model>): AutoDraft[] {
     if ((counts.get(label) ?? 0) < 2) continue
     drafts.push({
       preferredModels: [],
-      reasoning: [],
-      noReasoning: [],
       legacy: false,
       index: index + 1,
       familyFilter: label,
@@ -195,8 +215,7 @@ function autoDrafts(options: Options, models: Record<string, Model>): AutoDraft[
       requestedID: MODEL_ID,
       requestedName: "Auto",
       preferredModels: normalizeList(options.preferredModels),
-      reasoning: normalizeList(options.reasoning),
-      noReasoning: normalizeList(options.noReasoning),
+      tier: options.tier,
       legacy: true,
       index: 0,
     },
@@ -212,13 +231,17 @@ function autoDrafts(options: Options, models: Record<string, Model>): AutoDraft[
       requestedID: auto.id?.trim() || undefined,
       requestedName: auto.name?.trim() || undefined,
       preferredModels: normalizeList(auto.preferredModels),
-      reasoning: normalizeList(auto.reasoning),
-      noReasoning: normalizeList(auto.noReasoning),
+      tier: auto.tier,
       legacy: false,
       index: index + 1,
     })
   }
   return drafts
+}
+
+function usesDeprecatedLabelLists(options: Options): boolean {
+  const configs: AutoConfig[] = [options, ...(options.autos ?? [])]
+  return configs.some((c) => !!c.reasoning?.length || !!c.noReasoning?.length)
 }
 
 function slugify(value: string): string {
@@ -308,18 +331,18 @@ function capiBase(url: string) {
 }
 
 // Headers VS Code attaches to the auto-mode CAPI calls. Verified against
-// `@vscode/copilot-api`'s `_mixinHeaders`: every gated request (AutoModels,
-// ModelRouter, chat) ALWAYS carries Editor-Version, Editor-Plugin-Version and
+// `@vscode/copilot-api`'s `_mixinHeaders`: every gated request (Auto, AutoModels,
+// chat) ALWAYS carries Editor-Version, Editor-Plugin-Version and
 // Copilot-Integration-Id — VS Code never omits them.
 //
 // Copilot-Integration-Id is the *gate*. Its value is a cascade: an unlicensed /
 // open-source build sends "code-oss"; a licensed prod build sends "vscode-chat"
 // (and a dev build "vscode-chat-dev" + a Request-Hmac). So "code-oss" is the
 // honest, non-impersonating baseline — the minimum a real VS Code OSS build sends,
-// and the value to try first if /models/session/intent 404s. We keep these lines
-// commented to test the truly minimal set first, then add them back one by one.
-function copilotHeaders(bearer: string, sessionToken?: string): Record<string, string> {
-  const headers: Record<string, string> = {
+// and the value to try first if /auto 404s. We keep these lines commented to test
+// the truly minimal set first, then add them back one by one.
+function copilotHeaders(bearer: string): Record<string, string> {
+  return {
     Authorization: `Bearer ${bearer}`,
     "Content-Type": "application/json",
     "X-GitHub-Api-Version": COPILOT_API_VERSION,
@@ -330,158 +353,186 @@ function copilotHeaders(bearer: string, sessionToken?: string): Record<string, s
     "Editor-Device-Id": VSCODE_DEVICE_ID,
     // "Copilot-Integration-Id": "code-oss", // GATE: honest OSS-build value; "vscode-chat" impersonates licensed VS Code
   }
-  if (sessionToken) headers["Copilot-Session-Token"] = sessionToken
-  return headers
 }
 
-// POST /models/session — opens an auto session: returns the candidate pool, a
-// session token (drives the auto billing/rate-limit pool + discount), and
-// (undocumented) a default selected_model. Pure network call, no caching.
-async function fetchAutoSession(baseURL: string, bearer: string): Promise<AutoSession | undefined> {
-  const now = Date.now()
-  const response = await fetch(`${baseURL}/models/session`, {
-    method: "POST",
-    headers: copilotHeaders(bearer),
-    body: JSON.stringify({ auto_mode: { model_hints: [MODEL_ID] } }),
-  }).catch((error) => {
-    log(`auto session fetch failed: ${String(error)}`)
-    return undefined
-  })
-
-  if (!response) return undefined
-  if (!response.ok) {
-    const body = await response.text().catch(() => "")
-    log(`auto session fetch non-ok: ${response.status} ${body}`)
-    return undefined
-  }
-
-  const data = (await response.json().catch(() => undefined)) as
-    | {
-        selected_model?: unknown
-        session_token?: unknown
-        available_models?: unknown
-        discounted_costs?: unknown
-        expires_at?: unknown
-      }
-    | undefined
-
-  if (!data || typeof data.session_token !== "string") {
-    log("auto session fetch invalid payload (missing session_token)")
-    return undefined
-  }
-
-  const availableModels = Array.isArray(data.available_models)
-    ? (data.available_models.filter((m) => typeof m === "string") as string[])
-    : []
-  const selectedModelID = typeof data.selected_model === "string" ? data.selected_model : availableModels[0]
-  if (!selectedModelID) {
-    log("auto session fetch invalid payload (no selected_model and no available_models)")
-    return undefined
-  }
-  const discountedCosts =
-    data.discounted_costs && typeof data.discounted_costs === "object"
-      ? (data.discounted_costs as Record<string, number>)
-      : {}
-  const expiresAtMs = typeof data.expires_at === "number" ? data.expires_at * 1000 : now + 30 * 60_000
-
-  log(
-    `auto session parsed: selected_model=${selectedModelID}, available_models=[${availableModels.join(", ")}], discounted_costs=${JSON.stringify(discountedCosts)}`,
-  )
-  return { selectedModelID, sessionToken: data.session_token, availableModels, discountedCosts, expiresAtMs }
+function expiresAtMs(value: unknown, fallbackMs: number): number {
+  return typeof value === "number" ? value * 1000 : Date.now() + fallbackMs
 }
 
-// POST /models/session/intent — the router. This is the only call that sees the
-// prompt; it returns a ranked candidate list. Gated to first-party clients via
-// Copilot-Integration-Id, so without that header it may 404 (logged for inspection).
-async function getRouterDecision(
+// POST /auto — VS Code's Auto (AutoV2Fetcher.ts): routes the prompt, picks one model
+// and mints the session token its chat request bills against, in a single call.
+async function fetchAutoDecision(
   baseURL: string,
   bearer: string,
-  sessionToken: string,
   prompt: string,
-  availableModels: string[],
-  context: Record<string, unknown>,
-): Promise<RouterDecision | undefined> {
-  const body = { prompt, available_models: availableModels, ...context }
-  log(`intent request: ${JSON.stringify(body)}`)
+  tier: AutoTier,
+  hasImage: boolean,
+): Promise<AutoSession | undefined> {
+  const body: Record<string, unknown> = { prompt, tier }
+  if (hasImage) body.has_image = true
   const ac = new AbortController()
-  const timer = setTimeout(() => ac.abort(), INTENT_TIMEOUT_MS)
+  const timer = setTimeout(() => ac.abort(), AUTO_TIMEOUT_MS)
   try {
-    const response = await fetch(`${baseURL}/models/session/intent`, {
+    const response = await fetch(`${baseURL}/auto`, {
       method: "POST",
-      headers: copilotHeaders(bearer, sessionToken),
+      headers: copilotHeaders(bearer),
       body: JSON.stringify(body),
       signal: ac.signal,
     })
     if (!response.ok) {
       const text = await response.text().catch(() => "")
-      log(`intent fetch non-ok: ${response.status} ${text}`)
+      log(`auto fetch non-ok: ${response.status} ${text}`)
       return undefined
     }
-    const data = (await response.json().catch(() => undefined)) as RouterDecision | undefined
-    log(`intent response: ${JSON.stringify(data)}`)
-    return data
+    const data = (await response.json().catch(() => undefined)) as
+      | {
+          session_token?: unknown
+          expires_at?: unknown
+          selected_model?: { id?: unknown }
+          hydra_scores?: unknown
+          discounted_costs?: unknown
+        }
+      | undefined
+    const modelID = data?.selected_model?.id
+    if (!data || typeof data.session_token !== "string" || typeof modelID !== "string") {
+      log("auto fetch invalid payload (missing session_token or selected_model.id)")
+      return undefined
+    }
+    log(
+      `auto decision: selected_model=${modelID}, tier=${tier}, prompt_chars=${prompt.length}, hydra_scores=${JSON.stringify(data.hydra_scores ?? {})}, discounted_costs=${JSON.stringify(data.discounted_costs ?? {})}`,
+    )
+    // The token lasts 24h with no refresh flow.
+    return {
+      source: "auto",
+      models: [modelID],
+      sessionToken: data.session_token,
+      expiresAtMs: expiresAtMs(data.expires_at, 24 * 60 * 60_000),
+    }
   } catch (error) {
-    log(`intent fetch failed: ${String(error)}`)
+    log(`auto fetch failed: ${String(error)}`)
     return undefined
   } finally {
     clearTimeout(timer)
   }
 }
 
-// The cloned `auto` model points at ONE endpoint (template's npm + url). We can only
+// POST /models/session — Auto V1, which VS Code deleted in Aug 2026. Its pool no
+// longer receives new models and is shrinking; kept only as a fallback for when
+// POST /auto is unavailable.
+async function fetchLegacySession(baseURL: string, bearer: string): Promise<AutoSession | undefined> {
+  const response = await fetch(`${baseURL}/models/session`, {
+    method: "POST",
+    headers: copilotHeaders(bearer),
+    body: JSON.stringify({ auto_mode: { model_hints: [MODEL_ID] } }),
+  }).catch((error) => {
+    log(`legacy session fetch failed: ${String(error)}`)
+    return undefined
+  })
+  if (!response) return undefined
+  if (!response.ok) {
+    const body = await response.text().catch(() => "")
+    log(`legacy session fetch non-ok: ${response.status} ${body}`)
+    return undefined
+  }
+  const data = (await response.json().catch(() => undefined)) as
+    | { session_token?: unknown; available_models?: unknown; expires_at?: unknown }
+    | undefined
+  if (!data || typeof data.session_token !== "string") {
+    log("legacy session fetch invalid payload (missing session_token)")
+    return undefined
+  }
+  const models = Array.isArray(data.available_models)
+    ? (data.available_models.filter((m) => typeof m === "string") as string[])
+    : []
+  log(`legacy session parsed: available_models=[${models.join(", ")}]`)
+  return {
+    source: "legacy",
+    models,
+    sessionToken: data.session_token,
+    expiresAtMs: expiresAtMs(data.expires_at, 30 * 60_000),
+  }
+}
+
+// The cloned auto model points at ONE endpoint (template's npm + url). We can only
 // override the model id (chat.params), not the endpoint, so every model we route to
 // must share that endpoint family (cross-family would need a proxy — out of scope).
 function modelByApiId(apiId: string): Model | undefined {
   return autoKnownModels.find((m) => m.providerID === PROVIDER_ID && m.api.id === apiId)
 }
 
-function isSameFamily(apiId: string | undefined, templateApi?: TemplateAPI): boolean {
-  if (!apiId || !templateApi) return false
+// opencode's github-copilot provider sends GPT-5+ (except gpt-5-mini) over the
+// Responses API and everything else over Chat Completions. The request bodies
+// differ, so a routed model must use the same wire API as the anchor whose language
+// model actually builds the request.
+function wireAPI(api: { id: string; npm: string }): string {
+  if (api.npm === "@ai-sdk/anthropic") return "messages"
+  const match = /^gpt-(\d+)/.exec(api.id)
+  return match && Number(match[1]) >= 5 && !api.id.startsWith("gpt-5-mini") ? "responses" : "chat"
+}
+
+function isSameFamily(apiId: string | undefined, templateApi: TemplateAPI): boolean {
+  if (!apiId) return false
   if (apiId === templateApi.id) return true
   const model = modelByApiId(apiId)
-  return !!model && model.api.npm === templateApi.npm && model.api.url === templateApi.url
+  return (
+    !!model &&
+    model.api.npm === templateApi.npm &&
+    model.api.url === templateApi.url &&
+    wireAPI(model.api) === wireAPI(templateApi)
+  )
 }
 
-// Models of a given SDK family present in the auto pool. The within-family router needs
-// ≥2 (a strong + a fast tier) to have anything to choose between.
-function poolFamilyCount(npm: string, url: string, pool: string[]): number {
-  return pool.filter((id) => {
-    const model = modelByApiId(id)
-    return !!model && model.api.npm === npm && model.api.url === url
-  }).length
-}
+// Private header chat.headers uses to tell the fetch wrapper which model to send.
+const ROUTE_HEADER = "x-copilot-auto-route"
+const FETCH_WRAPPED = Symbol.for("opencode-github-copilot-auto-model.fetch")
 
-// Mirror VS Code's provider-stickiness: take the first candidate in our endpoint family.
-function pickSameFamilyCandidate(candidates: string[], preferredApiIDs: string[], templateApi?: TemplateAPI): string | undefined {
-  const sameFamily = candidates.filter((candidate) => isSameFamily(candidate, templateApi))
-  if (!sameFamily.length) return undefined
-  for (const preferred of preferredApiIDs) {
-    if (sameFamily.includes(preferred)) return preferred
+// opencode builds the auto's language model once, from the anchor's api.id, and its
+// Copilot/Anthropic SDKs take the request's model from that — they drop a `model`
+// passed through chat.params options. So the routed id travels in a private header
+// and is swapped into the JSON body here, just before the request leaves.
+function rewriteRoutedRequest(init: RequestInit | undefined): RequestInit | undefined {
+  if (!init?.headers) return init
+  const headers = new Headers(init.headers)
+  const model = headers.get(ROUTE_HEADER)
+  if (!model) return init
+  headers.delete(ROUTE_HEADER)
+  let body = init.body
+  if (typeof body === "string") {
+    try {
+      const parsed = JSON.parse(body) as { model?: unknown }
+      if (typeof parsed.model === "string" && parsed.model !== model) {
+        log(`request model ${parsed.model} -> ${model}`)
+        parsed.model = model
+        body = JSON.stringify(parsed)
+      }
+    } catch {
+      /* not JSON: send as-is */
+    }
   }
-  return sameFamily[0]
+  return { ...init, headers, body }
 }
 
-// Mirror VS Code's _selectDefaultModel: when the router is skipped/fails, the default
-// is the first model in the session pool (available_models) that resolves to a known
-// endpoint — in our case, the first one in the anchored family. VS Code derives the
-// default purely from available_models and never reads the undocumented selected_model.
-function defaultPoolModel(pool: string[], templateApi?: TemplateAPI): string | undefined {
-  return pool.find((id) => isSameFamily(id, templateApi))
+// The Copilot auth loader and the SDKs resolve the global fetch per call, so one
+// wrapper sees every outgoing request; it only acts on requests carrying ROUTE_HEADER.
+function installRouteFetch() {
+  const current = globalThis.fetch as typeof fetch & { [FETCH_WRAPPED]?: true }
+  if (current[FETCH_WRAPPED]) return
+  const wrapped = (input: RequestInfo | URL, init?: RequestInit) => current(input, rewriteRoutedRequest(init))
+  globalThis.fetch = Object.assign(wrapped, current, { [FETCH_WRAPPED]: true }) as unknown as typeof fetch
 }
 
-function preferredPoolModel(pool: string[], preferredApiIDs: string[], templateApi?: TemplateAPI): string | undefined {
-  for (const preferred of preferredApiIDs) {
-    if (pool.includes(preferred) && isSameFamily(preferred, templateApi)) return preferred
-  }
-  return undefined
+// Whether this auto can send `apiId`: same endpoint as its anchor and, for
+// family-clamped autos, the same family label (GPT and Gemini can share a transport).
+function servable(auto: InjectedAuto, apiId: string): boolean {
+  if (!isSameFamily(apiId, auto.templateApi)) return false
+  return !auto.familyFilter || familyLabel(modelByApiId(apiId)) === auto.familyFilter
 }
 
-// Map the router's reasoning verdict to a provider-native effort knob for the routed
-// model, in the same flat shape opencode's effort *variants* use (merged into options).
-// Boost-only: raise effort when the prompt needs reasoning and the model supports it;
-// leave fast turns at the model default (the router already picks a fast model there).
-function reasoningOptions(apiId: string, label: ConvState["routedLabel"]): Record<string, unknown> | undefined {
-  if (label !== "needs_reasoning") return undefined
+// Raise the routed model's effort on the "intelligence" tier, in the same flat shape
+// opencode's effort *variants* use (merged into options). Other tiers keep the model
+// default.
+function reasoningOptions(apiId: string, tier: AutoTier): Record<string, unknown> | undefined {
+  if (tier !== "intelligence") return undefined
   const model = modelByApiId(apiId)
   if (!model || !model.capabilities?.reasoning) return undefined
   if (model.api.npm === "@ai-sdk/anthropic") {
@@ -495,41 +546,19 @@ function reasoningOptions(apiId: string, label: ConvState["routedLabel"]): Recor
   return undefined
 }
 
-function configuredLabelForModel(auto: InjectedAuto, apiId: string): ConvState["routedLabel"] | undefined {
-  if (auto.reasoningApiIDs.includes(apiId)) return "needs_reasoning"
-  if (auto.noReasoningApiIDs.includes(apiId)) return "no_reasoning"
-  return undefined
-}
-
-function configuredModelForLabel(auto: InjectedAuto, label: ConvState["routedLabel"]): string | undefined {
-  const labelPrefs =
-    label === "needs_reasoning" ? auto.reasoningApiIDs
-    : label === "no_reasoning" ? auto.noReasoningApiIDs
-    : []
-  for (const preferred of labelPrefs) {
-    if (isSameFamily(preferred, auto.templateApi)) return preferred
-  }
-  for (const preferred of auto.preferredApiIDs) {
-    if (isSameFamily(preferred, auto.templateApi)) return preferred
-  }
-  return auto.catalogDefaultModelID ?? auto.templateApi?.id
-}
-
 function withAutoModels(models: Record<string, Model>, autos: InjectedAuto[]) {
   const injected = { ...models }
   for (const auto of autos) {
-    const template = auto.template ?? pickTemplate(models)
-    if (!template) continue
     if (injected[auto.id]) {
       if (auto.id !== MODEL_ID) log(`skip inject ${auto.id}: model id already exists`)
       continue
     }
-
+    const template = auto.template
     // Copy the template's api (id, npm, url) exactly — they already point to the right endpoint.
     // Claude models: url="…/v1" + npm="@ai-sdk/anthropic" → appends /messages → correct.
     // GPT models:   url="…"    + npm="@ai-sdk/github-copilot" → appends /chat/completions → correct.
     // Do NOT strip /v1 from the url; the Anthropic SDK appends /messages (not /v1/messages).
-    log(`injected ${auto.id} (${auto.name}) -> ${template.id} (api.id=${template.api.id}, npm=${template.api.npm}, url=${template.api.url})`)
+    log(`injected ${auto.id} (${auto.name}, tier=${auto.tier}) -> ${template.id} (api.id=${template.api.id}, npm=${template.api.npm}, url=${template.api.url})`)
     injected[auto.id] = {
       ...template,
       id: auto.id,
@@ -543,8 +572,10 @@ function withAutoModels(models: Record<string, Model>, autos: InjectedAuto[]) {
 
 const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
   const opts = (options ?? {}) as Options
+  installRouteFetch()
+  if (usesDeprecatedLabelLists(opts))
+    log("reasoning/noReasoning options are ignored: POST /auto returns no reasoning verdict (use tier instead)")
   const conversations = new Map<string, Map<string, ConvState>>()
-  let injectedAutos: InjectedAuto[] = []
   let injectedAutoByID = new Map<string, InjectedAuto>()
 
   function getConv(sessionID: string, autoID: string): ConvState {
@@ -555,30 +586,37 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
     }
     let conv = sessionAutos.get(autoID)
     if (!conv) {
-      conv = { turn: 0 }
+      conv = {}
       sessionAutos.set(autoID, conv)
     }
     return conv
   }
 
-  async function ensureSession(sessionID: string, autoID: string): Promise<AutoSession | undefined> {
-    const auto = injectedAutoByID.get(autoID)
-    if (!autoBearer || !auto?.templateApi) return undefined
-    const conv = getConv(sessionID, autoID)
-    if (conv.session && Date.now() < conv.session.expiresAtMs - SESSION_REFRESH_SKEW_MS) return conv.session
-    if (!conv.sessionInflight) {
-      const baseURL = capiBase(auto.templateApi.url)
-      const bearer = autoBearer
-      conv.sessionInflight = fetchAutoSession(baseURL, bearer)
-        .then((session) => {
-          if (session) conv.session = session
-          return conv.session
-        })
-        .finally(() => {
-          conv.sessionInflight = undefined
-        })
+  // One routing round: ask POST /auto (or the legacy pool when /auto is down) and
+  // pin the conversation to a model this auto's endpoint can serve.
+  async function resolveRoute(auto: InjectedAuto, conv: ConvState): Promise<Route> {
+    const fallback = auto.catalogDefaultModelID
+    const prompt = conv.lastPrompt
+    // expiresAtMs 0 → nothing to stick to; route again next turn.
+    if (!autoBearer || !prompt) return { modelID: fallback, expiresAtMs: 0 }
+    const baseURL = capiBase(auto.templateApi.url)
+    const session =
+      (await fetchAutoDecision(baseURL, autoBearer, prompt, auto.tier, !!conv.hasImage)) ??
+      (await fetchLegacySession(baseURL, autoBearer))
+    if (!session) return { modelID: fallback, expiresAtMs: 0 }
+    const usable = session.models.filter((id) => servable(auto, id))
+    const picked = auto.preferredApiIDs.find((id) => usable.includes(id)) ?? usable[0]
+    if (picked) {
+      log(`${auto.id} routed (${session.source}) -> ${picked}`)
+      return { modelID: picked, sessionToken: session.sessionToken, expiresAtMs: session.expiresAtMs }
     }
-    return conv.sessionInflight
+    // The server chose a model this auto's endpoint/family cannot send (or one missing
+    // from the opencode catalog). Stick with the catalog anchor for this session, sent
+    // without the token — it would be rejected for a model the session did not pick.
+    log(
+      `${auto.id}: server offered [${session.models.join(", ")}] (${session.source}), none servable via ${auto.templateApi.npm}${auto.familyFilter ? ` in family ${auto.familyFilter}` : ""}; using ${fallback} without Copilot-Session-Token`,
+    )
+    return { modelID: fallback, expiresAtMs: session.expiresAtMs }
   }
 
   // The status bar can't show the per-turn route, so surface it as a transient toast
@@ -591,7 +629,7 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
     }
   }
   return {
-    // After compaction the conversation shape changed, so re-run the router on the
+    // After compaction the conversation shape changed, so re-run routing on the
     // next turn (mirrors VS Code's invalidateRouterCache).
     event: async ({ event }) => {
       if (event.type !== "session.compacted") return
@@ -602,23 +640,20 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
       }
     },
     // Capture the prompt text per conversation; chat.params has the message but
-    // not its parts, so we stash the text here for the router call.
+    // not its parts, so we stash the text here for the routing call.
     "chat.message": async (input, output) => {
       const text = output.parts
         .filter((p) => p.type === "text")
         .map((p) => (p as { text?: string }).text ?? "")
         .join("\n")
         .trim()
-      const references = output.parts.filter((p) => p.type === "file").length
-      let autos = conversations.get(input.sessionID)
-      if (!autos?.size) {
-        autos = new Map<string, ConvState>()
-        conversations.set(input.sessionID, autos)
-      }
+      const hasImage = output.parts.some(
+        (p) => p.type === "file" && ((p as { mime?: string }).mime ?? "").startsWith("image/"),
+      )
       for (const autoID of injectedAutoByID.keys()) {
         const conv = getConv(input.sessionID, autoID)
         conv.lastPrompt = text
-        conv.referenceCount = references
+        conv.hasImage = hasImage
       }
     },
     "chat.params": async (incoming, output) => {
@@ -627,160 +662,52 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
       if (!auto) return
 
       const conv = getConv(incoming.sessionID, auto.id)
-      const session = await ensureSession(incoming.sessionID, auto.id) // refresh token on the turn
-      // Family-clamped autos only ever see pool entries / candidates of their own label
-      // family. Endpoint checks alone are not enough: GPT and Gemini can share the same
-      // transport (npm + url) on the github-copilot provider.
-      const matchesFamily = (apiId: string | undefined) => {
-        if (!auto.familyFilter) return true
-        if (!apiId) return false
-        const model = modelByApiId(apiId)
-        return !!model && familyLabel(model) === auto.familyFilter
-      }
-      const pool = (session?.availableModels ?? []).filter((id) => matchesFamily(id))
-      // Default to the first same-family model in the pool (VS Code's _selectDefaultModel),
-      // not the undocumented selected_model — kept only as a hint behind it. Everything here
-      // is clamped to the cloned endpoint's family (catalogDefaultModelID / templateApi.id
-      // always are; the session's selected pick may drift to another family).
-      let decided =
-        preferredPoolModel(pool, auto.preferredApiIDs, auto.templateApi) ??
-        defaultPoolModel(pool, auto.templateApi) ??
-        (isSameFamily(session?.selectedModelID, auto.templateApi) && matchesFamily(session?.selectedModelID)
-          ? session?.selectedModelID
-          : undefined) ??
-        auto.catalogDefaultModelID ??
-        auto.templateApi?.id
-      const prompt = conv.lastPrompt
-      const sessionMissingConfiguredPrefs =
-        !!session && auto.preferredApiIDs.length > 0 && !auto.preferredApiIDs.some((id) => session.availableModels.includes(id))
-      // A family-clamped auto whose family vanished from the session pool must not send
-      // its model with the session token (the server rejects out-of-pool models).
-      const sessionLacksFamilyModels =
-        !!session && !!auto.familyFilter && session.availableModels.length > 0 && pool.length === 0
-      const poolExcludesAuto = sessionMissingConfiguredPrefs || sessionLacksFamilyModels
-      if (poolExcludesAuto && auto.catalogDefaultModelID) {
-        conv.omitSessionToken = true
-        if (conv.routedModelID !== undefined && !conv.needsReEval) {
-          // Sticky: reuse the first turn's pick so the model — and its prompt KV cache —
-          // stays stable across turns, matching the main routing path and VS Code (which
-          // skips routing once turnCount > 0). Re-evaluated only after compaction.
-          decided = conv.routedModelID
-        } else {
-          let decision: RouterDecision | undefined
-          if (session.sessionToken && prompt && autoBearer && auto.templateApi && session.availableModels.length) {
-            const context = {
-              session_id: incoming.sessionID,
-              turn_number: conv.turn + 1,
-              previous_model: conv.previousModel,
-              reference_count: conv.referenceCount,
-              prompt_char_count: prompt.length,
-            }
-            decision = await getRouterDecision(
-              capiBase(auto.templateApi.url),
-              autoBearer,
-              session.sessionToken,
-              prompt,
-              session.availableModels,
-              context,
-            )
-          }
-          const routedLabel = decision?.predicted_label ?? configuredLabelForModel(auto, auto.catalogDefaultModelID)
-          decided = configuredModelForLabel(auto, routedLabel) ?? auto.catalogDefaultModelID
-          if (decided !== conv.routedModelID || routedLabel !== conv.routedLabel) {
-            toast(
-              `${auto.name} → ${decided}${routedLabel ? ` · ${routedLabel}` : " · configured"}`,
-              routedLabel === "needs_reasoning" ? "success" : "info",
-            )
-          }
-          conv.routedModelID = decided
-          conv.routedLabel = routedLabel
-          conv.needsReEval = false
-          log(`session pool lacks configured models for ${auto.id}; using ${decided} without Copilot-Session-Token`)
-        }
-      } else {
-        conv.omitSessionToken = false
-      }
-
-      if (session?.sessionToken && prompt && autoBearer && auto.templateApi && !poolExcludesAuto) {
-        if (!session.availableModels.length) {
-          log("intent skipped: session returned no available_models")
-        } else if (conv.routedModelID !== undefined && !conv.needsReEval) {
-          // Stick with the first turn's pick (re-evaluated only on compaction) so the
-          // model — and therefore the prompt KV cache — stays stable across turns.
-          // Matches VS Code's automode router, which skips routing once turnCount > 0.
-          decided = conv.routedModelID
-        } else {
-          const context = {
-            session_id: incoming.sessionID,
-            turn_number: conv.turn + 1,
-            previous_model: conv.previousModel,
-            reference_count: conv.referenceCount,
-            prompt_char_count: prompt.length,
-          }
-          const decision = await getRouterDecision(
-            capiBase(auto.templateApi.url),
-            autoBearer,
-            session.sessionToken,
-            prompt,
-            session.availableModels,
-            context,
+      // Route once per conversation and stick with it so the model — and its prompt
+      // KV cache — stays stable (VS Code reuses the endpoint for the rest of the
+      // conversation). Re-route after compaction, on token expiry, or after a failed
+      // round.
+      const stale =
+        !conv.route || conv.needsReEval || Date.now() >= conv.route.expiresAtMs - SESSION_REFRESH_SKEW_MS
+      if (stale) {
+        conv.routing ??= resolveRoute(auto, conv).finally(() => {
+          conv.routing = undefined
+        })
+        const route = await conv.routing
+        if (route.modelID !== conv.route?.modelID) {
+          toast(
+            `${auto.name} → ${route.modelID}${route.sessionToken ? "" : " · no Auto session"}`,
+            route.sessionToken ? "info" : "warning",
           )
-          const candidates = (decision?.candidate_models ?? []).filter((candidate) => matchesFamily(candidate))
-          if (candidates.length) {
-            // Use label-specific preferences when available; fall back to general list.
-            const label = decision?.predicted_label
-            const labelPrefs =
-              label === "needs_reasoning" ? auto.reasoningApiIDs
-              : label === "no_reasoning" ? auto.noReasoningApiIDs
-              : auto.preferredApiIDs
-            const effectivePrefs = labelPrefs.length ? labelPrefs : auto.preferredApiIDs
-            const sameFamily = pickSameFamilyCandidate(candidates, effectivePrefs, auto.templateApi)
-            if (sameFamily) {
-              decided = sameFamily
-              log(
-                `intent routed -> ${decided} (top=${candidates[0]}, label=${label}, confidence=${decision?.confidence})`,
-              )
-            } else {
-              log(`intent top=${candidates[0]} not same-family as ${auto.templateApi?.id}; keeping ${decided}`)
-            }
-          }
-          if (decided && decided !== conv.routedModelID) {
-            const reasoning = decision?.predicted_label === "needs_reasoning"
-            toast(
-              `${auto.name} → ${decided}${decision?.predicted_label ? ` · ${decision.predicted_label}` : ""}`,
-              reasoning ? "success" : "info",
-            )
-          }
-          conv.routedModelID = decided
-          conv.routedLabel = decision?.predicted_label
-          conv.needsReEval = false
         }
+        conv.route = route
+        conv.needsReEval = false
       }
 
-      conv.turn = conv.turn + 1
-
-      if (decided && decided !== incoming.model.id) {
-        output.options.model = decided
-        conv.previousModel = decided
-        log(`chat.params override ${auto.id} -> ${decided}`)
-        // Apply the routed reasoning effort every turn (sticky turns reuse routedLabel)
-        // so it stays consistent with the model across the conversation.
-        const effort = reasoningOptions(decided, conv.routedLabel)
-        if (effort) {
-          Object.assign(output.options, effort)
-          log(`reasoning effort -> ${JSON.stringify(effort)} for ${decided}`)
-        }
+      // The model itself is swapped in by the fetch wrapper (see chat.headers).
+      const decided = conv.route!.modelID
+      log(`chat.params route ${auto.id} -> ${decided}`)
+      // opencode sized the params for the anchor; the routed model may reject
+      // temperature (e.g. gpt-6-luna 400s with "not supported"). opencode itself passes
+      // undefined for such models, despite the hook's `number` type.
+      if (modelByApiId(decided)?.capabilities?.temperature === false && output.temperature !== undefined) {
+        ;(output as { temperature?: number }).temperature = undefined
+        log(`temperature dropped for ${decided}`)
+      }
+      const effort = reasoningOptions(decided, auto.tier)
+      if (effort) {
+        Object.assign(output.options, effort)
+        log(`reasoning effort -> ${JSON.stringify(effort)} for ${decided}`)
       }
     },
     "chat.headers": async (incoming, output) => {
       if (incoming.model.providerID !== PROVIDER_ID) return
       const auto = injectedAutoByID.get(incoming.model.id)
       if (!auto) return
-      const conv = getConv(incoming.sessionID, auto.id)
-      if (conv.omitSessionToken) return
-      const session = await ensureSession(incoming.sessionID, auto.id)
-      if (!session?.sessionToken) return
-      output.headers["Copilot-Session-Token"] = session.sessionToken
+      const route = getConv(incoming.sessionID, auto.id).route
+      if (!route) return
+      output.headers[ROUTE_HEADER] = route.modelID
+      if (!route.sessionToken) return
+      output.headers["Copilot-Session-Token"] = route.sessionToken
       log(`chat.headers added Copilot-Session-Token for ${auto.id}`)
     },
     provider: {
@@ -789,96 +716,36 @@ const CopilotAutoModelPlugin: Plugin = async ({ client }, options) => {
         autoKnownModels = Object.values(provider.models)
         autoBearer = ctx.auth?.type === "oauth" ? ctx.auth.refresh : undefined
         const drafts = autoDrafts(opts, provider.models)
-        const sessionCache = new Map<string, Promise<AutoSession | undefined>>()
         const usedIDs = new Set<string>([...Object.keys(provider.models), MODEL_ID])
         const usedNames = new Set<string>(["Auto"])
         const resolvedAutos: InjectedAuto[] = []
 
+        // No network here: POST /auto needs a prompt, so routing happens per turn.
+        // Each auto anchors on its first preferred model, else on the catalog.
         for (const draft of drafts) {
           const preferredApiIDs = resolvePreferredApiIDs(provider.models, draft.preferredModels)
-          const reasoningApiIDs = resolvePreferredApiIDs(provider.models, draft.reasoning)
-          const noReasoningApiIDs = resolvePreferredApiIDs(provider.models, draft.noReasoning)
-          let template = pickTemplate(provider.models, draft.familyFilter)
           const preferredTemplate = preferredApiIDs.map(modelByApiId).find((model): model is Model => !!model)
-          if (preferredTemplate) {
-            template = preferredTemplate
+          const template = preferredTemplate ?? pickTemplate(provider.models, draft.familyFilter)
+          if (!template) continue
+          if (preferredTemplate)
             log(`preference anchor${draft.legacy ? "" : ` (${draft.requestedName ?? draft.requestedID ?? draft.index})`} -> ${preferredTemplate.api.id}`)
-          }
-
-          if (template && ctx.auth?.type === "oauth") {
-            const baseURL = capiBase(template.api.url)
-            const sessionCacheKey = `${template.api.npm}\n${baseURL}`
-            let sessionPromise = sessionCache.get(sessionCacheKey)
-            if (!sessionPromise) {
-              // Catalog-level session only chooses the injected model's endpoint family
-              // + fallback default; each conversation still opens its own session.
-              sessionPromise = fetchAutoSession(baseURL, ctx.auth.refresh)
-              sessionCache.set(sessionCacheKey, sessionPromise)
-            }
-            const session = await sessionPromise
-            if (session) {
-              const preferredInPool = preferredApiIDs.find((id) => session.availableModels.includes(id))
-              if (preferredInPool) {
-                const preferredModel = modelByApiId(preferredInPool)
-                if (preferredModel) {
-                  template = preferredModel
-                  log(`preference session pick${draft.legacy ? "" : ` (${draft.requestedName ?? draft.requestedID ?? draft.index})`} -> ${preferredModel.api.id}`)
-                }
-              } else if (!preferredTemplate) {
-                // Family-clamped autos anchor on the first pool model of their family
-                // (VS Code's _selectDefaultModel, within the family); the unclamped
-                // legacy auto follows the session's selected model.
-                const sessionPick = draft.familyFilter
-                  ? session.availableModels
-                      .map(modelByApiId)
-                      .find((model) => model && familyLabel(model) === draft.familyFilter)
-                  : modelByApiId(session.selectedModelID)
-                template = sessionPick ?? template
-              }
-              // Guard: if the selected model's family has no fast/strong pair in the pool,
-              // the within-family router can't do anything — anchor on a family that does
-              // (still a genuine Copilot auto model from the pool). Never re-anchor a
-              // family-clamped auto: staying in its family is the whole point.
-              if (
-                !draft.familyFilter &&
-                !preferredTemplate &&
-                !preferredInPool &&
-                poolFamilyCount(template.api.npm, template.api.url, session.availableModels) < 2
-              ) {
-                const richer = session.availableModels
-                  .map(modelByApiId)
-                  .find((model) => model && poolFamilyCount(model.api.npm, model.api.url, session.availableModels) >= 2)
-                if (richer) {
-                  log(`family guard: ${template.api.id}'s family has <2 pool models; anchoring on ${richer.api.id}`)
-                  template = richer
-                }
-              }
-            }
-          }
 
           const baseName = draft.requestedName || defaultAutoName(draft, template)
           const baseID = draft.requestedID || defaultAutoID(draft, template)
-          const name = draft.legacy ? "Auto" : uniqueValue(baseName, usedNames, " ")
-          const id = draft.legacy ? MODEL_ID : uniqueValue(baseID, usedIDs)
           resolvedAutos.push({
-            id,
-            name,
-            preferredModels: draft.preferredModels,
-            reasoning: draft.reasoning,
-            noReasoning: draft.noReasoning,
+            id: draft.legacy ? MODEL_ID : uniqueValue(baseID, usedIDs),
+            name: draft.legacy ? "Auto" : uniqueValue(baseName, usedNames, " "),
             preferredApiIDs,
-            reasoningApiIDs,
-            noReasoningApiIDs,
+            tier: normalizeTier(draft.tier),
             template,
-            templateApi: template ? templateAPI(template) : undefined,
-            catalogDefaultModelID: template?.api.id,
+            templateApi: templateAPI(template),
+            catalogDefaultModelID: template.api.id,
             familyFilter: draft.familyFilter,
           })
         }
 
-        injectedAutos = resolvedAutos.filter((auto) => !!auto.template)
-        injectedAutoByID = new Map(injectedAutos.map((auto) => [auto.id, auto]))
-        return withAutoModels(provider.models, injectedAutos)
+        injectedAutoByID = new Map(resolvedAutos.map((auto) => [auto.id, auto]))
+        return withAutoModels(provider.models, resolvedAutos)
       },
     },
   }
